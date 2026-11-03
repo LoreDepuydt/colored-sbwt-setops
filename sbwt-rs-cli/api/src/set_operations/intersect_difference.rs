@@ -1,3 +1,7 @@
+// OLD-FILTER HYBRID (RECOMB27 item 4): this file and interleaving.rs are those of sbwt-rs-cli a6f7b61 (the
+// dummy repair with an auxiliary index and a three-way interleaving, before 9e2eb5c), in the tree of
+// dd90b8f; only changes: filter and filter_with_removed_positions take keep and group_starts by value
+// (as since 5b4acaf), and interleaving.rs has result_k_minus_1_marks of dd90b8f.
 use std::ops::Range;
 use std::sync::Arc;
 use bitvec::prelude::*;
@@ -5,13 +9,12 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
-use rayon::slice::ParallelSlice;
+use crate::builder::BitPackedKmerSortingMem;
 use crate::subsetseq::*;
 use crate::sbwt::*;
 use crate::atomic_bitmap::AtomicBitmap;
 use super::interleaving::{MergeInterleaving, ThreeWayInterleaving,
     compute_piece_ranges, compute_piece_ranges_three_way, count_result_nodes_per_piece, is_result_node};
-use super::dummy_chains::{needed_dummies, ExistingDummy, NeededDummies, NewDummy};
 use super::common::{allocate_rows, transpose_and_concat_pieces, build_index,
     word_and_popcount_range, word_diff_popcount_range};
 
@@ -19,6 +22,29 @@ type BitVec = bitvec::vec::BitVec<u64, Lsb0>;
 
 #[derive(Debug, Clone)]
 pub struct MissingSelectSupport; // An error type
+
+fn convert_index<SS: SubsetSeq>(idx: SbwtIndex<SubsetMatrix>, n_threads: usize, precalc_length: usize) -> SbwtIndex<SS> {
+    let n_sets = idx.n_sets();
+    let n_kmers = idx.n_kmers();
+    let k = idx.k();
+    let sigma = crate::util::DNA_ALPHABET.len();
+
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
+    let new_rows: Vec<BitVec> = pool.install(|| {
+        (0..sigma).into_par_iter().map(|c| {
+            let mut row = BitVec::new();
+            row.resize(n_sets, false);
+            for i in 0..n_sets {
+                if idx.sbwt().set_contains(i, c as u8) {
+                    row.set(i, true);
+                }
+            }
+            row
+        }).collect()
+    });
+
+    build_index::<SS>(new_rows, n_kmers, k, n_threads, precalc_length)
+}
 
 /// Counts the number of result positions and dummy result positions using
 /// parallel word-level operations over the interleaving's raw bit slices.
@@ -173,7 +199,7 @@ fn pass1_has_incoming<SS: SubsetSeq + Send + Sync>(
 }
 
 /// Collects s1-colex positions of result nodes that have no incoming edge and therefore
-/// need new dummy chains.  When `difference` is false the result predicate is `s1 & s2`
+/// need auxiliary dummy chains.  When `difference` is false the result predicate is `s1 & s2`
 /// (intersection); when true it is `s1 & !s2` (set difference).
 /// Positions marked in `redundant_s1` (dead dummy-chain nodes) are excluded: they are
 /// dropped from the result, so rebuilding their chains would just resurrect them.
@@ -267,58 +293,48 @@ fn reconstruct_source_kmers<SS: SubsetSeq + Send + Sync>(
 /// Any such orphaned child is recognizable purely from `has_incoming`: a shared dummy's
 /// child receives its unique incoming edge from that (now marked) parent, so an unmarked
 /// child with its bit set has just lost its incoming edge. The sweep clears those bits, so
-/// the orphans are collected as source nodes and the repair rebuilds their padding chains —
-/// re-creating exactly the marked ancestors they still need.
+/// the orphans are collected as source nodes and the auxiliary SBWT rebuilds their padding
+/// chains — re-creating exactly the marked ancestors they still need.
 ///
-/// Returns the marked set in `index1`'s colex space. The dead ends are walked in parallel in
-/// `thread_pool`: a walk stops at a node that another walk already marked, which goes on from
-/// there, so the marked set does not depend on the order.
-fn mark_dead_chains<SS: SubsetSeq + Sync>(
+/// Returns the marked set in `index1`'s colex space.
+fn mark_dead_chains<SS: SubsetSeq>(
     index1: &SbwtIndex<SS>,
     dead_ends: &[usize],
     has_incoming: &AtomicBitmap,
     sigma: usize,
-    thread_pool: &rayon::ThreadPool,
 ) -> BitVec {
-    let marks = AtomicBitmap::new(index1.n_sets());
-    thread_pool.install(|| dead_ends.par_iter().for_each(|&d| {
+    let mut redundant = BitVec::new();
+    redundant.resize(index1.n_sets(), false);
+
+    let mut marked: Vec<usize> = Vec::new();
+    for &d in dead_ends {
         let mut q = d;
-        while !marks.test_and_set(q) {
+        while !redundant[q] {
+            redundant.set(q, true);
+            marked.push(q);
             match index1.inverse_lf_step(q) {
                 Some(p) if p != 0 => q = p,
                 _ => break,
             }
         }
-    }));
-    let redundant = marks.into_bitvec_u64();
+    }
 
-    // Orphan sweep (after all marking, so `redundant` is final). Every node has one incoming edge,
-    // so each orphan is found once.
-    const CHUNK_WORDS: usize = 1024; // Words of the marks per parallel task (65536 nodes)
-    let (n_marked, n_orphans) = thread_pool.install(|| redundant.as_raw_slice().par_chunks(CHUNK_WORDS).enumerate().map(|(chunk, words)| {
-        let (mut n_marked, mut n_orphans) = (0usize, 0usize);
-        for (w, &word) in words.iter().enumerate() {
-            let mut word = word;
-            while word != 0 {
-                let p = (chunk * CHUNK_WORDS + w) * 64 + word.trailing_zeros() as usize;
-                word &= word - 1; // Clear the lowest set bit
-                n_marked += 1;
-                for c in 0..sigma {
-                    if index1.sbwt.set_contains(p, c as u8) {
-                        let t = index1.lf_step(p, c);
-                        if !redundant[t] && has_incoming.get(t) {
-                            has_incoming.set(t, false);
-                            n_orphans += 1;
-                        }
-                    }
+    // Orphan sweep (after all marking, so `redundant` is final).
+    let mut n_orphans = 0usize;
+    for &p in &marked {
+        for c in 0..sigma {
+            if index1.sbwt.set_contains(p, c as u8) {
+                let t = index1.lf_step(p, c);
+                if !redundant[t] && has_incoming.get(t) {
+                    has_incoming.set(t, false);
+                    n_orphans += 1;
                 }
             }
         }
-        (n_marked, n_orphans)
-    }).reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1)));
+    }
 
-    log::info!("Dead-chain removal: {} node(s) marked from {} dead end(s); {} orphan(s) get new dummy chains",
-        n_marked, dead_ends.len(), n_orphans);
+    log::info!("Dead-chain removal: {} node(s) marked from {} dead end(s); {} orphan(s) re-routed to the auxiliary index",
+        marked.len(), dead_ends.len(), n_orphans);
     redundant
 }
 
@@ -372,146 +388,30 @@ impl<SS: SubsetSeq> SecondInput<'_, SS> {
     }
 }
 
-/// The merge plan of the dummy repair: `merge_plan` with the new dummy nodes of `dummies` inserted
-/// as positions that are only in s3, and s3 also set at the positions of the needed dummy nodes
-/// that exist, the root included.
-///
-/// A new node `$^i α` goes right before the first node that ends with α, which starts a
-/// (k-1)-suffix group. With two or more dollars, its own (k-1)-suffix starts with a dollar, so it
-/// starts a group of its own. With one dollar, its (k-1)-suffix is α, so it is the first node of
-/// the group of that node, which then no longer starts the group. The new nodes before a node are
-/// sorted by decreasing number of dollars, so one with one dollar comes right before it. The edges
-/// of the s3 nodes are not copied: see [S3Edges].
-///
-/// The columns are built one at a time, and if `merge_plan` has no other reference, each of its
-/// columns is freed once its new column is built (and is_dummy right away): at most two columns
-/// of the merge plan and one column in pieces are then held next to the new columns, instead of
-/// the whole merge plan, the new plan in pieces and a concatenated column.
-fn insert_dummies(merge_plan: Arc<MergeInterleaving>, dummies: &NeededDummies, n_threads: usize) -> ThreeWayInterleaving {
-    let n = merge_plan.s1.len();
-    let pieces = crate::util::segment_range(0..n, n_threads);
-    let (mut own_s1, mut own_s2, own_is_leader, shared) = match Arc::try_unwrap(merge_plan) {
-        Ok(MergeInterleaving { s1, s2, is_leader, .. }) => (Some(s1), Some(s2), Some(is_leader), None),
-        Err(shared) => {
-            log::warn!("The merge plan has other references: its columns are freed only afterwards, which raises the peak memory of the dummy repair");
-            (None, None, None, Some(shared))
-        },
-    };
-    let old_is_leader = own_is_leader.as_ref().unwrap_or_else(|| &shared.as_ref().unwrap().is_leader);
-
-    let s1 = {
-        let old = own_s1.as_ref().unwrap_or_else(|| &shared.as_ref().unwrap().s1);
-        insert_dummies_column(&pieces, dummies, old_is_leader, false, Some(old), false)
-    };
-    drop(own_s1.take());
-    let s2 = {
-        let old = own_s2.as_ref().unwrap_or_else(|| &shared.as_ref().unwrap().s2);
-        insert_dummies_column(&pieces, dummies, old_is_leader, false, Some(old), false)
-    };
-    drop(own_s2.take());
-    // The new dummy nodes, and the needed nodes that exist, each after the new nodes inserted
-    // before it or before an earlier position
-    let mut s3 = insert_dummies_column(&pieces, dummies, old_is_leader, true, None, false);
-    for e in &dummies.existing {
-        s3.set(e.pos + dummies.new.partition_point(|d| d.pos <= e.pos), true);
-    }
-    let is_leader = insert_dummies_column(&pieces, dummies, old_is_leader, true, Some(old_is_leader), true);
-    ThreeWayInterleaving { s1, s2, s3, is_leader }
-}
-
-/// One column of the merge plan of [insert_dummies], built in parallel over `pieces` (ranges of
-/// positions of the merge plan): `new_bit` at the new dummy nodes, and at the other positions the
-/// bits of `old` (the column in the merge plan), or zeros without `old`. With `clear_joining`, a
-/// position before which a new node with one dollar was inserted gets a zero instead: that node
-/// starts the group of the position (for is_leader). `is_leader` is that of the merge plan.
-///
-/// The positions between two insertion points are copied as whole ranges of the old column, not
-/// bit by bit: there are few new nodes (thousands to millions) in billions of positions.
-fn insert_dummies_column(pieces: &[Range<usize>], dummies: &NeededDummies, is_leader: &BitVec, new_bit: bool, old: Option<&BitVec>, clear_joining: bool) -> BitVec {
-    // Appends the positions `range` of the old column
-    let copy = |part: &mut BitVec, range: Range<usize>| match old {
-        Some(old) => part.extend_from_bitslice(&old[range]),
-        None => part.resize(part.len() + range.len(), false),
-    };
-    let parts: Vec<BitVec> = pieces.par_iter().map(|range| {
-        // The new dummies of this piece, which come before their position
-        let first = dummies.new.partition_point(|d| d.pos < range.start);
-        let last = dummies.new.partition_point(|d| d.pos < range.end);
-        let mut part = BitVec::with_capacity(range.len() + last - first);
-        let mut copied = range.start; // The positions before this one are in part
-        let mut i = first;
-        while i < last {
-            let pos = dummies.new[i].pos;
-            assert!(is_leader[pos], "a new dummy node is not before the first node of a group");
-            copy(&mut part, copied..pos);
-            let mut joins_group = false; // Whether the last new node before pos has one dollar
-            while i < last && dummies.new[i].pos == pos {
-                part.push(new_bit);
-                joins_group = dummies.new[i].n_dollars == 1;
-                i += 1;
-            }
-            copied = pos;
-            if clear_joining && joins_group {
-                part.push(false);
-                copied = pos + 1;
-            }
-        }
-        copy(&mut part, copied..range.end);
-        debug_assert_eq!(part.len(), range.len() + last - first);
-        part
-    }).collect();
-    crate::util::parallel_bitvec_concat(parts)
-}
-
-/// The out-edges of the s3 nodes of the merge plan of the dummy repair (see [insert_dummies]), read
-/// from the needed dummy nodes without copying them to the positions of that merge plan. A position
-/// that is in neither input is a new dummy node, and the new dummy nodes are in the order of
-/// `dummies.new`; any other position p is position p - (the number of new nodes before it) of the
-/// merge plan that the needed dummy nodes refer to.
-struct S3Edges<'a> {
-    dummies: &'a NeededDummies,
-    n_new_before: usize, // The number of new dummy nodes before the current position
-    next_existing: usize, // The first existing needed node at or after the current position
-}
-
-impl<'a> S3Edges<'a> {
-    /// For reading from position `start` of the merge plan of the dummy repair on, in order.
-    fn new(dummies: &'a NeededDummies, start: usize) -> Self {
-        // The i-th new node is at position pos + i, after the i new nodes before it, so these
-        // positions increase with i
-        let new = &dummies.new;
-        let (mut lo, mut hi) = (0, new.len());
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if new[mid].pos + mid < start { lo = mid + 1 } else { hi = mid }
-        }
-        // The position in the merge plan that the needed dummy nodes refer to
-        let old_start = start - lo;
-        Self { dummies, n_new_before: lo, next_existing: dummies.existing.partition_point(|e| e.pos < old_start) }
-    }
-
-    /// Writes the out-edges of the s3 node at `pos` into `edges` if `read`, and moves past `pos`,
-    /// which is a new dummy node if `is_new`. Called for every position in order.
-    fn advance(&mut self, pos: usize, read: bool, is_new: bool, edges: &mut [bool]) {
-        if read {
-            if is_new {
-                let d = &self.dummies.new[self.n_new_before];
-                debug_assert_eq!(d.pos + self.n_new_before, pos);
-                for (c, e) in edges.iter_mut().enumerate() { *e = (d.edges >> c) & 1 == 1; }
-            } else {
-                let old = pos - self.n_new_before;
-                // The positions come in order, so the node is found by moving forward in the list
-                let existing = &self.dummies.existing;
-                while existing[self.next_existing].pos < old {
-                    self.next_existing += 1;
+/// The positions of the second input of a filter (see [SecondInput::Keep]) in a merge plan of
+/// index1 and another index: the positions of index1 (set in `s1`) whose node is kept.
+fn kept_positions(s1: &BitVec, kept: &BitVec) -> BitVec {
+    const CHUNK: usize = 1 << 16; // Positions per parallel task, a multiple of 64
+    let n = s1.len();
+    let chunks: Vec<Range<usize>> = (0..n).step_by(CHUNK).map(|start| start..(start + CHUNK).min(n)).collect();
+    let mut s1_starts: Vec<usize> = chunks.par_iter().map(|range| s1[range.clone()].count_ones()).collect();
+    let mut sum = 0;
+    for x in s1_starts.iter_mut() { (*x, sum) = (sum, sum + *x); }
+    let words: Vec<Vec<u64>> = chunks.par_iter().zip(s1_starts).map(|(range, mut s1_colex)| {
+        let mut part = bitvec![u64, Lsb0; 0; range.len()];
+        for pos in range.clone() {
+            if s1[pos] {
+                if kept[s1_colex] {
+                    part.set(pos - range.start, true);
                 }
-                let node = existing[self.next_existing];
-                debug_assert_eq!(node.pos, old, "an s3 node is neither new nor an existing needed node");
-                for (c, e) in edges.iter_mut().enumerate() { *e = (node.edges >> c) & 1 == 1; }
+                s1_colex += 1;
             }
         }
-        self.n_new_before += is_new as usize;
-    }
+        part.into_vec()
+    }).collect();
+    let mut result = BitVec::from_vec(words.concat());
+    result.truncate(n);
+    result
 }
 
 /// Direct pass 2: builds the result SBWT bit-rows when every result position already has an
@@ -628,17 +528,17 @@ fn rows_direct<SS: SubsetSeq + Send + Sync>(
 
 /// Dummy-repair pass 2: some result k-mers are new source nodes (their predecessor k-mers exist
 /// in index1 but not in the result), so their dummy predecessor chains are absent. Remedy:
-/// reconstruct those source k-mers (in parallel), find the dummy nodes of their chains in the merge
-/// plan (see [needed_dummies]), insert the new ones into it, and produce the complete bit-rows from
-/// that merge plan, whose s3 are the dummy nodes of the chains. Edge rule: c is set iff a chain
-/// has it, or index1 and index2 keep it (see [keeps]).
+/// reconstruct those source k-mers (in parallel), build a small auxiliary SBWT from them, then use
+/// a single three-way interleaving of (index1, index2, aux) to produce the complete bit-rows. Edge
+/// rule: c is set iff aux has it, or index1 and index2 keep it (see [keeps]).
 ///
 /// The same pass also leaves out the dead dummy chains: `redundant_s1` (index1 colex space,
 /// precomputed by [`mark_dead_chains`]) marks every node of every chain whose real
 /// k-mer did not survive the operation. Marked nodes are not emitted as result nodes and
 /// edges whose LF-step target is marked are not written. This is safe even when a marked
-/// node lies on a new source's padding chain: that node is in s3, so the `s3` term of the
-/// predicate re-emits it and `s3_or` supplies both its row and its incoming edge.
+/// node lies on a new source's padding chain: the aux contains the very same node, so the
+/// `s3` term of the predicate re-emits it and `s3_or` supplies both its row and its
+/// incoming edge — dead is dead, and the aux brings back exactly what it needs.
 ///
 /// If `record_result_nodes` is true, also returns the three-way interleaving and the positions of
 /// the result nodes in it (one bit per position, set for the result nodes).
@@ -646,11 +546,11 @@ fn rows_direct<SS: SubsetSeq + Send + Sync>(
 fn rows_with_dummy_repair<SS: SubsetSeq + Send + Sync + Clone>(
     index1: Arc<SbwtIndex<SS>>,
     second: SecondInput<'_, SS>,
-    merge_plan: Arc<MergeInterleaving>,
     source_colexes: Vec<usize>,
     redundant_s1: Option<&BitVec>,
     sigma: usize,
     k: usize,
+    optimize_peak_ram: bool,
     difference: bool,
     record_result_nodes: bool,
     n_threads: usize,
@@ -661,29 +561,30 @@ fn rows_with_dummy_repair<SS: SubsetSeq + Send + Sync + Clone>(
     let source_kmers = thread_pool.install(|| reconstruct_source_kmers(&index1, &source_colexes, k));
     drop(source_colexes);
 
-    log::info!("{} Dummy repair: finding the dummy chains of the sources in the merge plan", log_prefix);
-    // The root is needed also without sources (when only dead chains are removed): the difference
-    // needs it, because the root is in both inputs, so it is in the difference only through s3.
-    let dummies = match &second {
-        SecondInput::Index(index2) => thread_pool.install(|| needed_dummies(&index1, Some(index2), &merge_plan.s1, Some(&merge_plan.s2), &source_kmers)),
-        // The positions of the merge plan are the nodes of index1
-        SecondInput::Keep(_) => thread_pool.install(|| needed_dummies(&index1, None, &merge_plan.s1, None, &source_kmers)),
-    };
+    log::info!("{} Dummy repair: building auxiliary SBWT from source k-mers", log_prefix);
+    let (aux_submatrix, _) = BitPackedKmerSortingMem::new_from_vecs(&source_kmers, k)
+        .n_threads(n_threads)
+        .add_all_dummy_paths(true)
+        .run();
     drop(source_kmers);
-    // The memory of the dummy repair, the peak of filter, in the log: what it consists of
-    let bytes = |bits: &BitVec| bits.capacity() / 8;
-    let dummies_bytes = dummies.new.capacity() * std::mem::size_of::<NewDummy>() + dummies.existing.capacity() * std::mem::size_of::<ExistingDummy>();
-    let dead_bytes = redundant_s1.map_or(0, bytes);
-    crate::util::log_memory(log_prefix, "after finding the dummy chains", &[
-        ("merge plan", bytes(&merge_plan.s1) + bytes(&merge_plan.s2) + bytes(&merge_plan.is_dummy) + bytes(&merge_plan.is_leader)),
-        ("needed dummies", dummies_bytes), ("dead chains", dead_bytes)]);
 
-    log::info!("{} Dummy repair: inserting {} new dummy node(s) into the merge plan", log_prefix, dummies.new.len());
-    // Frees the merge plan as it goes, if this is its only reference
-    let three_way = thread_pool.install(|| insert_dummies(merge_plan, &dummies, n_threads));
-    let three_way_bytes = bytes(&three_way.s1) + bytes(&three_way.s2) + bytes(&three_way.s3) + bytes(&three_way.is_leader);
-    crate::util::log_memory(log_prefix, "after inserting the dummies", &[
-        ("three-way merge plan", three_way_bytes), ("needed dummies", dummies_bytes), ("dead chains", dead_bytes)]);
+    let aux_arc = Arc::new(convert_index::<SS>(aux_submatrix, n_threads, 0));
+
+    // Build a single three-way interleaving of (index1, index2, aux).
+    // This replaces three separate 2-way interleaving computations + two intermediate merges,
+    // reducing dummy-repair overhead from O(3·(N+Naux)·k) to O((N+Naux)·k).
+    log::info!("{} Dummy repair: building three-way interleaving", log_prefix);
+    let three_way = match &second {
+        SecondInput::Index(index2) => ThreeWayInterleaving::new(&index1, index2, &aux_arc, optimize_peak_ram, n_threads),
+        SecondInput::Keep(kept) => {
+            // The second input has no nodes of its own: its positions are the kept nodes of index1
+            // (see SecondInput::Keep), so a merge plan of index1 and aux suffices
+            let plan = MergeInterleaving::new(&index1, &aux_arc, optimize_peak_ram, n_threads);
+            let s2 = thread_pool.install(|| kept_positions(&plan.s1, kept));
+            let MergeInterleaving { s1, s2: s3, is_leader, .. } = plan;
+            ThreeWayInterleaving { s1, s2, s3, is_leader }
+        },
+    };
 
     log::info!("{} Dummy repair: building {} SBWT bit-rows via three-way pass (parallel)", log_prefix, result_name);
     let (tw_ranges, s1_pc, s2_pc, s3_pc) =
@@ -719,10 +620,9 @@ fn rows_with_dummy_repair<SS: SubsetSeq + Send + Sync + Clone>(
             let mut s1_first_in_group = 0usize;
             let mut piece_rel_result_leader: Option<usize> = None;
             let mut result_colex_in_piece = 0usize;
-            let mut s3_edges = S3Edges::new(&dummies, colex_range.start);
 
             // Writes the edge bits of the current group at its result leader `l`. Edges into the
-            // dead set can only originate from the root's group or a dead (revived through s3) group —
+            // dead set can only originate from the root's group or a dead (aux-revived) group —
             // every dead node's parent is dead or the root — so all other groups skip the
             // per-edge lf_step target check.
             let flush = |l: usize, s1_or: &[bool], s2_or: &mut [bool], s3_or: &[bool], s1_first: usize, rows: &mut [BitVec]| {
@@ -754,14 +654,13 @@ fn rows_with_dummy_repair<SS: SubsetSeq + Send + Sync + Clone>(
                     second.read_group_edges(s2_colex, &mut s2_or);
                     s2_read = true;
                 }
-                // The positions of the merge plan are in s1 or s2, the new dummy nodes in neither
-                let is_new = !three_way.s1[merged_colex] && !three_way.s2[merged_colex];
-                let read_s3 = !s3_read && three_way.s3[merged_colex];
-                s3_edges.advance(merged_colex, read_s3, is_new, &mut s3_or);
-                s3_read |= read_s3;
+                if !s3_read && three_way.s3[merged_colex] {
+                    for c in 0..sigma { s3_or[c] = aux_arc.sbwt.set_contains(s3_colex, c as u8); }
+                    s3_read = true;
+                }
 
                 // s1_colex (not yet incremented) is this node's index1 colex position; dead nodes
-                // are not result nodes unless a dummy chain needs them (s3).
+                // are not result nodes unless the aux re-emits them via s3.
                 let is_result = is_result_node(&three_way, merged_colex, s1_colex, difference, redundant_s1);
                 if record_result_nodes {
                     piece_result_marks.push(is_result);
@@ -792,13 +691,9 @@ fn rows_with_dummy_repair<SS: SubsetSeq + Send + Sync + Clone>(
         }).collect()
     });
 
-    let piece_bytes: usize = pieces.iter().map(|(rows, marks)| rows.iter().map(bytes).sum::<usize>() + bytes(marks)).sum();
-    crate::util::log_memory(log_prefix, "after the three-way pass", &[
-        ("three-way merge plan", three_way_bytes), ("rows and result marks in pieces", piece_bytes), ("needed dummies", dummies_bytes), ("dead chains", dead_bytes)]);
-
     drop(index1);
     drop(second);
-    drop(dummies);
+    drop(aux_arc);
     let (row_pieces, result_mark_pieces): (Vec<Vec<BitVec>>, Vec<BitVec>) = pieces.into_iter().unzip();
     // Without recording, the interleaving and the empty marks are freed before the rows are
     // concatenated, which allocates the rows of the whole result
@@ -806,8 +701,6 @@ fn rows_with_dummy_repair<SS: SubsetSeq + Send + Sync + Clone>(
 
     log::info!("{} Dummy repair: transposing and concatenating pieces", log_prefix);
     let rows = thread_pool.install(|| transpose_and_concat_pieces(row_pieces, sigma));
-    crate::util::log_memory(log_prefix, "after concatenating the rows", &[
-        ("rows", rows.iter().map(bytes).sum()), ("kept three-way merge plan and result marks", positions.as_ref().map_or(0, |(_, marks)| three_way_bytes + bytes(marks)))]);
     (rows, positions)
 }
 
@@ -835,12 +728,9 @@ fn with_removed_positions<SS: SubsetSeq>((index, positions): (SbwtIndex<SS>, Opt
 /// Only dummy nodes shared by both SBWTs are retained. After pass 1, a parallel count detects
 /// whether any k-mers became source nodes in the intersection, and pass 1 also reports the
 /// dead-end dummies (shared dummies whose chain no longer leads to a surviving k-mer). If there
-/// is neither, pass 2 returns the result directly. Otherwise, the dummy nodes of the missing
-/// chains are found in the given interleaving (by searching the prefixes of the source k-mers in
-/// the inputs), the new ones are inserted into it, and the rows are built from that, without the
-/// dead-end chains.
-///
-/// `optimize_peak_ram` has no effect: the interleaving is given, and the repair computes none.
+/// is neither, pass 2 returns the result directly. Otherwise, an auxiliary SBWT is built from
+/// those source k-mers (with parallel k-mer reconstruction) and merged via a three-way
+/// interleaving that repairs the missing dummy chains and strips the dead-end ones.
 pub fn intersect<SS: SubsetSeq + Send + Sync + Clone>(
     index1: Arc<SbwtIndex<SS>>,
     index2: Arc<SbwtIndex<SS>>,
@@ -849,8 +739,7 @@ pub fn intersect<SS: SubsetSeq + Send + Sync + Clone>(
     optimize_peak_ram: bool,
     n_threads: usize,
 ) -> Result<SbwtIndex<SS>, MissingSelectSupport> {
-    let _ = optimize_peak_ram; // No effect: the merge plan is given, and the repair computes none
-    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, false, false, n_threads)
+    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, optimize_peak_ram, false, false, n_threads)
         .map(|(index, _)| index)
 }
 
@@ -862,9 +751,9 @@ pub fn intersect<SS: SubsetSeq + Send + Sync + Clone>(
 ///
 /// If no dummy chains need to be repaired, the returned interleaving is `interleaving` with an
 /// empty s3. Its bit vectors are moved out of the Arc if this is the only reference to it, and
-/// copied otherwise. If dummy chains are repaired, it is `interleaving` with the new dummy nodes of
-/// the chains inserted, and s3 marks the dummy nodes of the chains: a position that is only in s3
-/// is a new dummy node, in neither input.
+/// copied otherwise. If dummy chains are repaired, it is the three-way interleaving of `index1`,
+/// `index2` and the auxiliary index of the repair: a position that is only in s3 is a new dummy
+/// node, in neither input.
 pub fn intersect_with_removed_positions<SS: SubsetSeq + Send + Sync + Clone>(
     index1: Arc<SbwtIndex<SS>>,
     index2: Arc<SbwtIndex<SS>>,
@@ -873,8 +762,7 @@ pub fn intersect_with_removed_positions<SS: SubsetSeq + Send + Sync + Clone>(
     optimize_peak_ram: bool,
     n_threads: usize,
 ) -> Result<(SbwtIndex<SS>, ThreeWayInterleaving, BitVec), MissingSelectSupport> {
-    let _ = optimize_peak_ram; // No effect: the merge plan is given, and the repair computes none
-    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, false, true, n_threads)
+    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, optimize_peak_ram, false, true, n_threads)
         .map(with_removed_positions)
 }
 
@@ -890,11 +778,10 @@ pub fn intersect_with_removed_positions<SS: SubsetSeq + Send + Sync + Clone>(
 /// is in `index1` but not in `index2`.
 ///
 /// Like [`intersect`], a direct pass is taken when no difference k-mer becomes a source node
-/// and no dummy became a dead end. Otherwise, the missing dummy chains are repaired and the dead
-/// ones excluded exactly as in the intersection, with the edge rule
-/// `s3_or[c] || (s1_or[c] && !s2_or[c])`, where `s3_or` are the edges of the dummy chains.
-///
-/// `optimize_peak_ram` has no effect, as for [intersect].
+/// and no dummy became a dead end. Otherwise, an auxiliary SBWT is built from the reconstructed
+/// source k-mers and a three-way interleaving with edge rule `s3_or[c] || (s1_or[c] && !s2_or[c])`
+/// is used to repair the missing dummy chains, while dead dummy chains are excluded from the
+/// result exactly as in the intersection.
 pub fn difference<SS: SubsetSeq + Send + Sync + Clone>(
     index1: Arc<SbwtIndex<SS>>,
     index2: Arc<SbwtIndex<SS>>,
@@ -903,8 +790,7 @@ pub fn difference<SS: SubsetSeq + Send + Sync + Clone>(
     optimize_peak_ram: bool,
     n_threads: usize,
 ) -> Result<SbwtIndex<SS>, MissingSelectSupport> {
-    let _ = optimize_peak_ram; // No effect: the merge plan is given, and the repair computes none
-    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, true, false, n_threads)
+    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, optimize_peak_ram, true, false, n_threads)
         .map(|(index, _)| index)
 }
 
@@ -919,8 +805,7 @@ pub fn difference_with_removed_positions<SS: SubsetSeq + Send + Sync + Clone>(
     optimize_peak_ram: bool,
     n_threads: usize,
 ) -> Result<(SbwtIndex<SS>, ThreeWayInterleaving, BitVec), MissingSelectSupport> {
-    let _ = optimize_peak_ram; // No effect: the merge plan is given, and the repair computes none
-    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, true, true, n_threads)
+    intersect_or_difference(index1, SecondInput::Index(index2), interleaving, new_prefix_lookup_table_length, optimize_peak_ram, true, true, n_threads)
         .map(with_removed_positions)
 }
 
@@ -932,12 +817,9 @@ pub fn difference_with_removed_positions<SS: SubsetSeq + Send + Sync + Clone>(
 ///
 /// The filter is computed as an [intersect] of `index` and an input that has exactly the kept
 /// k-mers, without building that input: a merge plan of `index` with itself gives the positions,
-/// and the edges of that input are those of `index` that lead to a kept k-mer. The (k-1)-suffix
-/// groups of `index` are taken from `group_starts` (one bit per node, set for the first node of
-/// each group, e.g. from an LCS array), or computed from `index` if it is None. `keep` and
-/// `group_starts` are taken over, so that they are freed as soon as they are no longer needed.
-///
-/// `optimize_peak_ram` has no effect, as for [intersect].
+/// and the edges of that input are those of `index` that lead to a kept k-mer. The (k-1)-suffix groups of `index` are taken from `group_starts` (one bit per node, set
+/// for the first node of each group, e.g. from an LCS array), or computed from `index` if it is
+/// None.
 pub fn filter<SS: SubsetSeq + Send + Sync + Clone>(
     index: Arc<SbwtIndex<SS>>,
     keep: BitVec,
@@ -946,8 +828,7 @@ pub fn filter<SS: SubsetSeq + Send + Sync + Clone>(
     optimize_peak_ram: bool,
     n_threads: usize,
 ) -> Result<SbwtIndex<SS>, MissingSelectSupport> {
-    let _ = optimize_peak_ram; // No effect: the merge plan is given, and the repair computes none
-    filter_impl(index, keep, group_starts, new_prefix_lookup_table_length, false, n_threads)
+    filter_impl(index, &keep, group_starts.as_ref(), new_prefix_lookup_table_length, optimize_peak_ram, false, n_threads)
         .map(|(index, _)| index)
 }
 
@@ -962,8 +843,7 @@ pub fn filter_with_removed_positions<SS: SubsetSeq + Send + Sync + Clone>(
     optimize_peak_ram: bool,
     n_threads: usize,
 ) -> Result<(SbwtIndex<SS>, ThreeWayInterleaving, BitVec), MissingSelectSupport> {
-    let _ = optimize_peak_ram; // No effect: the merge plan is given, and the repair computes none
-    filter_impl(index, keep, group_starts, new_prefix_lookup_table_length, true, n_threads)
+    filter_impl(index, &keep, group_starts.as_ref(), new_prefix_lookup_table_length, optimize_peak_ram, true, n_threads)
         .map(with_removed_positions)
 }
 
@@ -978,9 +858,10 @@ fn to_u64_words(bits: bitvec::vec::BitVec) -> BitVec {
 #[allow(clippy::type_complexity)]
 fn filter_impl<SS: SubsetSeq + Send + Sync + Clone>(
     index: Arc<SbwtIndex<SS>>,
-    keep: BitVec,
-    group_starts: Option<BitVec>,
+    keep: &BitVec,
+    group_starts: Option<&BitVec>,
     new_prefix_lookup_table_length: usize,
+    optimize_peak_ram: bool,
     return_positions: bool,
     n_threads: usize,
 ) -> Result<(SbwtIndex<SS>, Option<(ThreeWayInterleaving, BitVec)>), MissingSelectSupport> {
@@ -990,7 +871,7 @@ fn filter_impl<SS: SubsetSeq + Send + Sync + Clone>(
     let is_leader = match group_starts {
         Some(group_starts) => {
             assert_eq!(group_starts.len(), n);
-            group_starts
+            group_starts.clone()
         },
         None => {
             log::info!("[filter] Computing the (k-1)-suffix groups");
@@ -1001,14 +882,14 @@ fn filter_impl<SS: SubsetSeq + Send + Sync + Clone>(
 
     // All dummy nodes are kept: the dummy chains that lead to no kept k-mer are removed as dead
     // chains, as in an intersection.
-    let mut kept = keep;
+    let mut kept = keep.clone();
     kept |= &is_dummy;
     // The word-wise counts of the merge plan also see the bits after the end of the last word
     kept.set_uninitialized(false);
     let mut s1 = bitvec![u64, Lsb0; 1; n];
     s1.set_uninitialized(false);
     let merge_plan = MergeInterleaving { s1, s2: kept.clone(), is_dummy, is_leader };
-    intersect_or_difference(index, SecondInput::Keep(&kept), Arc::new(merge_plan), new_prefix_lookup_table_length, false, return_positions, n_threads)
+    intersect_or_difference(index, SecondInput::Keep(&kept), Arc::new(merge_plan), new_prefix_lookup_table_length, optimize_peak_ram, false, return_positions, n_threads)
 }
 
 /// Implementation of [intersect], [difference] (if `difference` is true) and [filter], and of their
@@ -1021,6 +902,7 @@ fn intersect_or_difference<SS: SubsetSeq + Send + Sync + Clone>(
     second: SecondInput<'_, SS>,
     interleaving: Arc<MergeInterleaving>,
     new_prefix_lookup_table_length: usize,
+    optimize_peak_ram: bool,
     difference: bool,
     return_positions: bool,
     n_threads: usize,
@@ -1069,7 +951,7 @@ fn intersect_or_difference<SS: SubsetSeq + Send + Sync + Clone>(
     });
 
     let (new_rows, positions) = if dead_end_dummies.is_empty() && n_incoming == result_length {
-        log::info!("{} All {} {} positions have incoming edges; no dummy chains to repair", log_prefix, result_length, result_name);
+        log::info!("{} All {} {} positions have incoming edges; no auxiliary dummy chains needed", log_prefix, result_length, result_name);
         log::info!("{} Pass 2: building {} SBWT bit-rows (parallel)", log_prefix, result_name);
         if return_positions {
             let rows = rows_direct(
@@ -1104,15 +986,15 @@ fn intersect_or_difference<SS: SubsetSeq + Send + Sync + Clone>(
             (rows, None)
         }
     } else {
-        log::info!("{} {} source(s) missing dummy chains; repairing them",
+        log::info!("{} {} source(s) missing dummy chains; merging with auxiliary index",
             log_prefix, result_length - n_incoming);
 
         // Mark the dead chains (unconditionally, up to the root) and clear the incoming-edge
         // bits of any orphaned children BEFORE collecting sources: orphans must be collected
-        // so the repair rebuilds their padding chains. The rows pass of the repair excludes
-        // marked nodes and the edges into them.
+        // so the auxiliary index rebuilds their padding chains. The three-way pass excludes
+        // marked nodes and the edges into them while building the rows.
         let redundant_s1: Option<BitVec> = if dead_end_dummies.is_empty() { None } else {
-            Some(mark_dead_chains(&index1, &dead_end_dummies, &has_incoming, sigma, &thread_pool))
+            Some(mark_dead_chains(&index1, &dead_end_dummies, &has_incoming, sigma))
         };
         drop(dead_end_dummies);
 
@@ -1121,9 +1003,13 @@ fn intersect_or_difference<SS: SubsetSeq + Send + Sync + Clone>(
             merged_length, result_length - n_incoming, // capacity hint
             difference, n_threads, &thread_pool,
         );
+        drop(interleaving); // No longer needed; free before the aux-index build.
+        // The auxiliary index always has a root, even when there are no sources (when only dead
+        // chains are removed). The difference needs it: the root is in both inputs, so it is in
+        // the difference only through s3.
         rows_with_dummy_repair(
-            index1, second, interleaving, source_colexes, redundant_s1.as_ref(),
-            sigma, k, difference, return_positions, n_threads, &thread_pool,
+            index1, second, source_colexes, redundant_s1.as_ref(),
+            sigma, k, optimize_peak_ram, difference, return_positions, n_threads, &thread_pool,
         )
     };
 
@@ -1131,92 +1017,3 @@ fn intersect_or_difference<SS: SubsetSeq + Send + Sync + Clone>(
     Ok((build_index(new_rows, n_kmers, k, n_threads, new_prefix_lookup_table_length), positions))
 }
 
-#[cfg(test)]
-mod tests {
-    use rand_chacha::rand_core::{RngCore, SeedableRng};
-    use rayon::prelude::*;
-
-    use super::{insert_dummies_column, BitVec, NeededDummies};
-    use crate::set_operations::dummy_chains::NewDummy;
-
-    /// insert_dummies_column as it was, bit by bit: the reference for the range copies.
-    fn by_bit(pieces: &[std::ops::Range<usize>], dummies: &NeededDummies, new_bit: bool, bit: impl Fn(usize, bool) -> bool + Sync) -> BitVec {
-        let parts: Vec<BitVec> = pieces.par_iter().map(|range| {
-            let first = dummies.new.partition_point(|d| d.pos < range.start);
-            let last = dummies.new.partition_point(|d| d.pos < range.end);
-            let mut next = dummies.new[first..last].iter().peekable();
-            let mut part = BitVec::new();
-            for pos in range.clone() {
-                let mut joins_group = false;
-                while let Some(d) = next.next_if(|d| d.pos == pos) {
-                    part.push(new_bit);
-                    joins_group = d.n_dollars == 1;
-                }
-                part.push(bit(pos, joins_group));
-            }
-            part
-        }).collect();
-        crate::util::parallel_bitvec_concat(parts)
-    }
-
-    /// A merge plan of `n` positions with random columns and groups, and `n_new` new dummy nodes
-    /// before random group starts, several before some (by decreasing number of dollars).
-    fn random_plan(n: usize, n_new: usize, seed: u64) -> (BitVec, BitVec, NeededDummies) {
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
-        let column: BitVec = (0..n).map(|_| rng.next_u32() % 2 == 0).collect();
-        let mut is_leader: BitVec = (0..n).map(|_| rng.next_u32() % 4 == 0).collect();
-        if n > 0 { is_leader.set(0, true); }
-        let leaders: Vec<usize> = is_leader.iter_ones().collect();
-        let mut new: Vec<NewDummy> = (0..n_new).filter(|_| !leaders.is_empty()).map(|_| NewDummy {
-            pos: leaders[rng.next_u32() as usize % leaders.len()],
-            n_dollars: 1 + rng.next_u32() % 3,
-            edges: 1,
-        }).collect();
-        new.sort_by_key(|d| (d.pos, std::cmp::Reverse(d.n_dollars)));
-        new.dedup_by_key(|d| (d.pos, d.n_dollars));
-        (column, is_leader, NeededDummies { new, existing: Vec::new() })
-    }
-
-    /// The range copies give the same columns as bit by bit, for each kind of column, with pieces
-    /// that start and end anywhere, also between new dummy nodes of one position.
-    #[test]
-    fn insert_dummies_column_matches_by_bit() {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
-        pool.install(|| {
-            for (n, n_new) in [(0, 0), (1, 0), (1, 3), (100, 0), (100, 40), (5000, 3000), (70000, 200)] {
-                let (column, is_leader, dummies) = random_plan(n, n_new, n as u64);
-                for n_pieces in [1, 3, 7] {
-                    let pieces = crate::util::segment_range(0..n, n_pieces);
-                    let case = format!("n {n}, {} new, {n_pieces} piece(s)", dummies.new.len());
-                    assert_eq!(insert_dummies_column(&pieces, &dummies, &is_leader, false, Some(&column), false),
-                        by_bit(&pieces, &dummies, false, |pos, _| column[pos]), "s1/s2, {case}");
-                    assert_eq!(insert_dummies_column(&pieces, &dummies, &is_leader, true, None, false),
-                        by_bit(&pieces, &dummies, true, |_, _| false), "s3, {case}");
-                    assert_eq!(insert_dummies_column(&pieces, &dummies, &is_leader, true, Some(&is_leader), true),
-                        by_bit(&pieces, &dummies, true, |pos, joins_group| is_leader[pos] && !joins_group), "is_leader, {case}");
-                }
-            }
-        });
-    }
-
-    /// Times the range copies against bit by bit on a merge plan of 2^32 positions with a million
-    /// new dummy nodes, on 32 threads: cargo test --release insert_dummies_column_speed -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn insert_dummies_column_speed() {
-        let n = 1usize << 32;
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(32).build().unwrap();
-        let (column, is_leader, dummies) = random_plan(n, 1_000_000, 1);
-        let pieces = crate::util::segment_range(0..n, 32);
-        pool.install(|| {
-            let t = std::time::Instant::now();
-            let fast = insert_dummies_column(&pieces, &dummies, &is_leader, false, Some(&column), false);
-            let fast_s = t.elapsed().as_secs_f64();
-            let t = std::time::Instant::now();
-            let slow = by_bit(&pieces, &dummies, false, |pos, _| column[pos]);
-            let slow_s = t.elapsed().as_secs_f64();
-            assert_eq!(fast, slow);
-            println!("{} positions, {} new dummy nodes: range copies {:.2} s, bit by bit {:.2} s", n, dummies.new.len(), fast_s, slow_s);
-        });
-    }
-}

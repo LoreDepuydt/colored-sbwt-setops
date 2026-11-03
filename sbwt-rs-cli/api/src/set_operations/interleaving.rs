@@ -36,10 +36,9 @@ type BitSlice = bitvec::slice::BitSlice<u64, Lsb0>;
 ///
 /// The intersection and the difference may turn a k-mer into a *source k-mer* (see
 /// [here](crate#details-on-the-space-usage-of-the-index)) whose dummy predecessor chain is present in
-/// neither input, and may leave dummy chains of the inputs leading nowhere. Both are repaired in
-/// the interleaving of the inputs: the dummy nodes of the missing chains are found by searching the
-/// prefixes of the source k-mers, and the new ones are inserted, so the result is always
-/// structurally identical to an index built from scratch from the result k-mers.
+/// neither input, and may leave dummy chains of the inputs leading nowhere. Both are repaired by
+/// building a small auxiliary index of the affected k-mers and interleaving it with the two inputs, so
+/// the result is always structurally identical to an index built from scratch from the result k-mers.
 /// For this, [intersect](crate::intersect) and [difference](crate::difference) require
 /// [select support](SbwtIndex::build_select) on the first input, and return an error if it is missing.
 ///
@@ -339,25 +338,151 @@ impl MergeInterleaving {
     }
 }
 
-/// An interleaving of `index1`, `index2` and a third set of nodes: the interleaving that the result
-/// of an intersection, a difference or a filter with repaired dummy chains consists of, where the
-/// third set (s3) is the dummy nodes of those chains.
+/// A three-way interleaving of `index1`, `index2`, and a small auxiliary SBWT (`aux`).
 ///
-/// For every colex position `i`:
+/// Used when some result k-mers become new source nodes and need fresh dummy chains built via
+/// an auxiliary SBWT. Replaces three separate 2-way interleaving computations (plus two
+/// intermediate merges) with a single O((N1+N2+Naux)·k) pass.
+///
+/// For every colex position `i` in the three-way merged space:
 /// * `s1[i]` — position belongs to `index1`,
 /// * `s2[i]` — position belongs to `index2`,
-/// * `s3[i]` — position belongs to the third set,
+/// * `s3[i]` — position belongs to `aux`,
 /// * `is_leader[i]` — position is the colex-minimum node of its (k-1)-suffix group.
 ///
-/// For an intersection, a position is a **result node** iff `(s1[i] && s2[i]) || s3[i]` (except
-/// for dead dummy chains), and the edge-bits at a result node are `s3_or[c] || (s1_or[c] &&
-/// s2_or[c])`, where the ORs are accumulated over all positions in the same (k-1)-suffix group.
+/// A position is a **result node** iff `(s1[i] && s2[i]) || s3[i]`.
+/// Edge-bits at a result node are `(s1_or[c] || s3_or[c]) && (s2_or[c] || s3_or[c])`,
+/// where the ORs are accumulated over all positions in the same (k-1)-suffix group.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThreeWayInterleaving {
     pub s1: BitVec,
     pub s2: BitVec,
     pub s3: BitVec,
     pub is_leader: BitVec,
+}
+
+impl ThreeWayInterleaving {
+    /// Compute the three-way interleaving of `index1`, `index2`, and `aux`.
+    /// All three indices must share the same `k`.
+    /// If `optimize_peak_ram` is true, uses compact 3-bit character encoding to reduce memory usage.
+    pub fn new<SS: SubsetSeq + Send + Sync>(
+        index1: &SbwtIndex<SS>,
+        index2: &SbwtIndex<SS>,
+        aux: &SbwtIndex<SS>,
+        optimize_peak_ram: bool,
+        n_threads: usize,
+    ) -> ThreeWayInterleaving {
+
+
+        let k = index1.k();
+        assert_eq!(k, index2.k());
+        assert_eq!(k, aux.k());
+
+        log::info!(
+            "Computing three-way intersection interleaving: index1={} sets, index2={} sets, aux={} sets, k={}",
+            index1.n_sets(), index2.n_sets(), aux.n_sets(), k
+        );
+
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
+        thread_pool.install(|| {
+            let mut leader_bits: Option<BitVec> = None;
+
+            // Start each segmentation with a single group containing all nodes of that index.
+            let mut s1 = bitvec![u64, Lsb0; 0; index1.n_sets()];
+            let mut s2 = bitvec![u64, Lsb0; 0; index2.n_sets()];
+            let mut s3 = bitvec![u64, Lsb0; 0; aux.n_sets()];
+            s1.push(true);
+            s2.push(true);
+            s3.push(true);
+
+            use CharVector::*;
+            let (mut chars1, mut chars2, mut chars3, mut temp_char_buf_1, mut temp_char_buf_2, mut temp_char_buf_3) = if optimize_peak_ram {
+                (Compact(index1.build_last_column_compact()),
+                 Compact(index2.build_last_column_compact()),
+                 Compact(aux.build_last_column_compact()),
+                 None,
+                 None,
+                 None,
+                )
+            } else {
+                (ByteAlphabet(index1.build_last_column()),
+                 ByteAlphabet(index2.build_last_column()),
+                 ByteAlphabet(aux.build_last_column()),
+                 Some(CharVector::init_with_byte_alphabet(index1.n_sets())),
+                 Some(CharVector::init_with_byte_alphabet(index2.n_sets())),
+                 Some(CharVector::init_with_byte_alphabet(aux.n_sets())),
+                )
+            };
+
+            // A tiny aux (down to root-only, when there are no source k-mers) has too few
+            // label positions to split across threads; empty ranges trip asserts inside
+            // push_all_labels_forward. Push its labels single-threaded in that case.
+            let aux_n_threads = if aux.n_sets() < 2 * n_threads { 1 } else { n_threads };
+
+            for round in 0..k {
+                log::info!("Three-way interleaving round {}/{}", round + 1, k);
+
+                let p1 = split_to_pieces_par(&s1, n_threads);
+                let p2 = split_to_pieces_par(&s2, n_threads);
+                let p3 = split_to_pieces_par(&s3, n_threads);
+
+                let pieces: Vec<_> = (0..n_threads)
+                    .map(|i| (p1[i].0, p2[i].0, p3[i].0,
+                              p1[i].1.clone(), p2[i].1.clone(), p3[i].1.clone()))
+                    .collect();
+
+                let new_arrays = match (&chars1, &chars2, &chars3) {
+                    (ByteAlphabet(c1), ByteAlphabet(c2), ByteAlphabet(c3)) => {
+                        refine_segmentation_three_way(s1, s2, s3, c1, c2, c3, pieces, round == k - 1)
+                    },
+                    (Compact(c1), Compact(c2), Compact(c3)) => {
+                        refine_segmentation_three_way(s1, s2, s3, c1, c2, c3, pieces, round == k - 1)
+                    },
+                    _ => panic!("Programmer messed up")
+                };
+                (s1, s2, s3, leader_bits) = new_arrays;
+
+                if round != k - 1 {
+                    if let (ByteAlphabet(ref mut c1), ByteAlphabet(ref mut c2), ByteAlphabet(ref mut c3),
+                            Some(ByteAlphabet(ref mut t1)), Some(ByteAlphabet(ref mut t2)), Some(ByteAlphabet(ref mut t3)))
+                        = (&mut chars1, &mut chars2, &mut chars3, &mut temp_char_buf_1, &mut temp_char_buf_2, &mut temp_char_buf_3)
+                    {
+                        index1.push_all_labels_forward(c1, t1, n_threads);
+                        std::mem::swap(c1, t1);
+                        index2.push_all_labels_forward(c2, t2, n_threads);
+                        std::mem::swap(c2, t2);
+                        aux.push_all_labels_forward(c3, t3, aux_n_threads);
+                        std::mem::swap(c3, t3);
+                    } else if let (Compact(ref mut c1), Compact(ref mut c2), Compact(ref mut c3), None, None, None)
+                        = (&mut chars1, &mut chars2, &mut chars3, &mut temp_char_buf_1, &mut temp_char_buf_2, &mut temp_char_buf_3)
+                    {
+                        let mut t1 = CompactIntVector::<3>::new(c1.len());
+                        index1.push_all_labels_forward_compact(c1, &mut t1, n_threads);
+                        std::mem::swap(c1, &mut t1);
+                        drop(t1);
+                        let mut t2 = CompactIntVector::<3>::new(c2.len());
+                        index2.push_all_labels_forward_compact(c2, &mut t2, n_threads);
+                        std::mem::swap(c2, &mut t2);
+                        drop(t2);
+                        let mut t3 = CompactIntVector::<3>::new(c3.len());
+                        aux.push_all_labels_forward_compact(c3, &mut t3, aux_n_threads);
+                        std::mem::swap(c3, &mut t3);
+                        drop(t3);
+                    } else {
+                        panic!("Programmer messed up");
+                    }
+                }
+            }
+
+            drop(temp_char_buf_1);
+            drop(temp_char_buf_2);
+            drop(temp_char_buf_3);
+
+            let leader_bits = leader_bits.unwrap();
+
+            ThreeWayInterleaving { s1, s2, s3, is_leader: leader_bits }
+        })
+    }
 }
 
 /// The (k-1)-suffix groups of the result of a set operation, as [Dbg::new_with_k_minus_1_marks]
@@ -441,6 +566,118 @@ fn mark_dummy_nodes<V: ReadOnlyIntVector + Send + Sync>(s1: &BitVec, s2: &BitVec
 
 }
 
+// Three-way version of refine_piece: merges three sorted character ranges into sub-groups.
+#[allow(clippy::too_many_arguments)]
+fn refine_piece_three_way<V: ReadOnlyIntVector + Send + Sync>(
+    s1: &BitVec, s2: &BitVec, s3: &BitVec,
+    chars1: &V, chars2: &V, chars3: &V,
+    mut c1_i: usize, mut c2_i: usize, mut c3_i: usize,
+    s1_range: Range<usize>, s2_range: Range<usize>, s3_range: Range<usize>,
+    last_round: bool,
+) -> (BitVec, BitVec, BitVec, Option<BitVec>) {
+    let est_cap = s1_range.len() + s2_range.len() + s3_range.len();
+    let mut out1 = BitVec::with_capacity(est_cap);
+    let mut out2 = BitVec::with_capacity(est_cap);
+    let mut out3 = BitVec::with_capacity(est_cap);
+    let mut leader_bits = if last_round { BitVec::with_capacity(est_cap) } else { BitVec::new() };
+
+    let mut s1_i = s1_range.start;
+    let mut s2_i = s2_range.start;
+    let mut s3_i = s3_range.start;
+
+    while s1_i < s1_range.end {
+        assert!(s2_i < s2_range.end);
+        assert!(s3_i < s3_range.end);
+
+        let len1 = leading_zeros(&s1[s1_i..]);
+        let len2 = leading_zeros(&s2[s2_i..]);
+        let len3 = leading_zeros(&s3[s3_i..]);
+
+        let c1_end = c1_i + len1;
+        let c2_end = c2_i + len2;
+        let c3_end = c3_i + len3;
+
+        let mut is_leader = true;
+        while c1_i < c1_end || c2_i < c2_end || c3_i < c3_end {
+            let cv1 = if c1_i == c1_end { u8::MAX } else { chars1.get(c1_i) as u8 };
+            let cv2 = if c2_i == c2_end { u8::MAX } else { chars2.get(c2_i) as u8 };
+            let cv3 = if c3_i == c3_end { u8::MAX } else { chars3.get(c3_i) as u8 };
+            let c = min(cv1, min(cv2, cv3));
+
+            let r1 = run_length_in_sorted_seq(chars1, c1_i..c1_end, c);
+            let r2 = run_length_in_sorted_seq(chars2, c2_i..c2_end, c);
+            let r3 = run_length_in_sorted_seq(chars3, c3_i..c3_end, c);
+
+            if last_round {
+                out1.push(r1 > 0);
+                out2.push(r2 > 0);
+                out3.push(r3 > 0);
+            } else {
+                zero_extend(&mut out1, r1); out1.push(true);
+                zero_extend(&mut out2, r2); out2.push(true);
+                zero_extend(&mut out3, r3); out3.push(true);
+            }
+
+            c1_i += r1;
+            c2_i += r2;
+            c3_i += r3;
+
+            if last_round { leader_bits.push(is_leader); }
+            is_leader = false;
+        }
+
+        s1_i += len1 + 1;
+        s2_i += len2 + 1;
+        s3_i += len3 + 1;
+    }
+
+    assert_eq!(s1_i, s1_range.end);
+    assert_eq!(s2_i, s2_range.end);
+    assert_eq!(s3_i, s3_range.end);
+
+    (out1, out2, out3, if last_round { Some(leader_bits) } else { None })
+}
+
+// Three-way version of refine_segmentation.
+// Input pieces are 6-tuples: (start_in_chars1, start_in_chars2, start_in_chars3,
+//                              range_in_s1, range_in_s2, range_in_s3).
+fn refine_segmentation_three_way<V: ReadOnlyIntVector + Send + Sync>(
+    s1: BitVec, s2: BitVec, s3: BitVec,
+    chars1: &V, chars2: &V, chars3: &V,
+    input_pieces: Vec<(usize, usize, usize, Range<usize>, Range<usize>, Range<usize>)>,
+    last_round: bool,
+) -> (BitVec, BitVec, BitVec, Option<BitVec>) {
+    let output_pieces: Vec<(BitVec, BitVec, BitVec, Option<BitVec>)> =
+        input_pieces.par_iter().map(|(c1, c2, c3, r1, r2, r3)| {
+            refine_piece_three_way(
+                &s1, &s2, &s3, chars1, chars2, chars3,
+                *c1, *c2, *c3, r1.clone(), r2.clone(), r3.clone(), last_round,
+            )
+        }).collect();
+
+    drop(s1);
+    drop(s2);
+    drop(s3);
+
+    let mut ps1 = vec![];
+    let mut ps2 = vec![];
+    let mut ps3 = vec![];
+    let mut lp = if last_round { Some(vec![]) } else { None };
+    for (a, b, c, d) in output_pieces {
+        ps1.push(a);
+        ps2.push(b);
+        ps3.push(c);
+        if last_round { lp.as_mut().unwrap().push(d.unwrap()); }
+    }
+
+    (
+        crate::util::parallel_bitvec_concat(ps1),
+        crate::util::parallel_bitvec_concat(ps2),
+        crate::util::parallel_bitvec_concat(ps3),
+        lp.map(crate::util::parallel_bitvec_concat),
+    )
+}
+
 // Computes per-piece ranges aligned to group leaders and per-piece popcounts for s1, s2, s3
 // in a ThreeWayInterleaving. Returns at most n_threads pieces, all non-empty.
 pub(super) fn compute_piece_ranges_three_way(
@@ -459,8 +696,8 @@ pub(super) fn compute_piece_ranges_three_way(
 // or `(s1 && !s2 && !dead) || s3`. `s1_colex` is the number of s1 positions before `merged_colex`.
 //
 // `redundant_s1` (in index1 colex space) marks dead dummy-chain nodes: those are not result nodes
-// through the s1-side predicate (they can still be result nodes through `s3` when a repaired dummy
-// chain needs the same node). Every pass that needs the result nodes uses this function, so
+// through the s1-side predicate (they can still be result nodes through `s3` when the auxiliary
+// index contains the same node). Every pass that needs the result nodes uses this function, so
 // that they all agree.
 #[inline]
 pub(super) fn is_result_node(
