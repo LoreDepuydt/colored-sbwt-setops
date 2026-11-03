@@ -1,0 +1,505 @@
+//! A streaming query index that uses right extensions and left contractions to find matches.
+
+use std::ops::Range;
+
+use crate::subsetseq::*;
+use crate::sbwt::*;
+use rayon::iter::IndexedParallelIterator;
+use rayon::iter::IntoParallelRefMutIterator;
+use rayon::iter::ParallelIterator;
+use simple_sds_sbwt::ops::Access;
+use simple_sds_sbwt::ops::Push;
+use simple_sds_sbwt::ops::Vector;
+use simple_sds_sbwt::serialize::Serialize;
+
+/// Extending a search pattern to the right.
+pub trait ExtendRight {
+    /// Takes the interval I of a pattern P in an SBWT and returns the interval of
+    /// pattern Pc.
+    fn extend_right(&self, I: std::ops::Range<usize>, c: u8) -> std::ops::Range<usize>;
+}
+
+/// Contracting a search pattern from the left.
+pub trait ContractLeft {
+    /// Takes the interval I of a pattern cP in an SBWT, where c is a single character, and returns the interval of
+    /// pattern P. If I is the empty string, then this should return back the interval
+    /// of the empty string.
+    fn contract_left(&self, I: std::ops::Range<usize>, target_len: usize) -> std::ops::Range<usize>;
+}
+
+/// An index that uses right extensions and left contractions to find matches in a streaming fashion.
+/// The Copy trait is implemented because this struct contains only references to components of the
+/// index, so it can be copied around cheaply.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub struct StreamingIndex<'a, E: ExtendRight, C: ContractLeft> {
+    pub extend_right: &'a E,
+    pub contract_left: &'a C,
+    pub n: usize, // The empty string has colex range [0,n)
+    pub k: usize, // Maximum length of a match
+}
+
+
+impl<'a, SS: SubsetSeq> StreamingIndex<'a, SbwtIndex<SS>, LcsArray> {
+
+    /// Create a new streaming index using an SBWT index for right extensions
+    /// and an LCS array for left contractions.
+    pub fn new(sbwt: &'a SbwtIndex<SS>, lcs: &'a LcsArray) -> Self {
+        StreamingIndex{contract_left: lcs, extend_right: sbwt, n: sbwt.n_sets(), k: sbwt.k()}
+    }
+
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    pub fn sbwt_len(&self) -> usize {
+        self.n
+    }
+}
+/// An array that stores the lengths of the longest common suffixes of consecutive k-mers in 
+/// colexicographic order. 
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct LcsArray {
+    lcs: simple_sds_sbwt::int_vector::IntVector,
+}
+
+impl ContractLeft for LcsArray {
+
+    /// Expands the interval by scanning left and right until the LCS value is less than `target_len`.
+    /// This has worst case time complexity equal to the length of LCS array, but if used on short intervals, the
+    /// performance is typically quite good. 
+    #[allow(non_snake_case)]
+    fn contract_left(&self, I: std::ops::Range<usize>, target_len: usize) -> std::ops::Range<usize> {
+        let mut new_start = I.start;
+        let mut new_end = I.end;
+        while new_start > 0 && self.lcs.get(new_start) >= target_len as u64 {
+            new_start -= 1;
+        }
+        let n = self.lcs.len();
+        while new_end < n && self.lcs.get(new_end) >= target_len as u64 {
+            new_end += 1;
+        }
+        new_start..new_end
+    }
+}
+
+// Any SbwtIndex can be used for right extensions.
+impl<SS: SubsetSeq> ExtendRight for SbwtIndex<SS> {
+
+    /// Right extensions implemented time O(t), where t is the time for a rank query in the
+    /// subset rank query implementation of `SS`. This is O(1) for [SubsetMatrix]. 
+    #[allow(non_snake_case)]
+    fn extend_right(&self, I: std::ops::Range<usize>, c: u8) -> std::ops::Range<usize> {
+        let c_idx = self.char_idx(c);
+        self.lf_step(I.start, c_idx)..self.lf_step(I.end, c_idx)
+    }
+
+}
+
+/// An LCS array implementation using ceil(log(k)) bits per element. 
+impl LcsArray {
+
+    /// Construct from a pre-built LCS array stored in an [IntVector](simple_sds_sbwt::int_vector::IntVector).
+    pub fn new(v: simple_sds_sbwt::int_vector::IntVector) -> Self {
+        Self{lcs: v}
+    }
+    
+    /// Access the LCS value at position i.
+    pub fn access(&self, i: usize) -> usize {
+        self.lcs.get(i) as usize
+    }
+
+    /// Returns the number of elements in the LCS array.
+    pub fn len(&self) -> usize {
+        self.lcs.len()
+    }
+
+    /// Returns true iff the length of the array is zero.
+    pub fn is_empty(&self) -> bool {
+        self.lcs.len() == 0
+    }
+
+    /// Returns the number of bytes used by the LCS array.
+    pub fn size_in_bytes(&self) -> usize {
+        self.lcs.size_in_bytes()
+    }
+
+    /// Serialize the LCS array to the given writer.
+    /// The array can then later be loaded with [LcsArray::load].
+    /// Returns number of bytes written.
+    pub fn serialize<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<usize>{
+        let mut n_written = 0_usize;
+        self.lcs.serialize(out)?;
+        n_written += self.lcs.size_in_bytes();
+        Ok(n_written)
+    }
+
+    /// Load an LCS array that was previously serialized with [LcsArray::serialize].
+    pub fn load<R: std::io::Read>(input: &mut R) -> std::io::Result<Self>{
+        let lcs = simple_sds_sbwt::int_vector::IntVector::load(input)?;
+        Ok(Self{lcs})
+    }
+
+    /// Build an LCS array using the given SBWT index. This runs an O(nk) time algorithm, where
+    /// n is the number of k-mers in the padded spectrum encoded in the SBWT, and k is the length
+    /// of the k-mers. The algorithm works by inverting the SBWT column by column, which takes
+    /// 2n bytes of extra working space, or less if optimize_peak_ram is true. The algorithm is described in the paper
+    /// [Longest Common Prefix Arrays for Succinct k-spectra](https://doi.org/10.48550/arXiv.2306.04850).
+    pub fn from_sbwt<SS: SubsetSeq + Sync>(sbwt: &SbwtIndex<SS>, n_threads: usize, optimize_peak_ram: bool) -> Self {
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
+
+        // The array stores values in the range [0..k-1], so we need
+        // ceil(log2(k)) = bits per element.
+        let k = sbwt.k();
+        let bit_width = 64 - u64::leading_zeros((k as isize -1) as u64);
+
+        // We store 1 byte per value before IntVector compression, and use lcs[i] = k to
+        // mark that the value has not been computed yet. So the maximum k we can support
+        // is k = 255.
+        assert!(k <= 255);
+
+        log::info!("Initializing...");
+        // The value of k is used to denote that a value has not been computed yet.
+        // This is okay since all LCS value are strictly smaller than k.
+        let mut lcs = vec![k as u8; sbwt.n_sets()];
+
+        lcs[0] = 0; // By definition
+
+        // Iterate columns from right to left
+        log::info!("Building column {} of the SBWT matrix", k-1);
+        if optimize_peak_ram {
+            let mut labels_in = sbwt.build_last_column_compact();
+            let mut labels_out = labels_in.clone();
+            for round in 0..k {
+                if round > 0 {
+                    log::info!("Building column {} of the SBWT matrix", k-1-round);
+                    sbwt.push_all_labels_forward_compact(&labels_in, &mut labels_out, n_threads);
+                }
+                log::info!("Storing LCS values of {}", round);
+                thread_pool.install(||{
+                    lcs.par_iter_mut().enumerate().for_each(|(i, x)| {
+                        if *x == k as u8 && labels_out.get(i) != labels_out.get(i-1) {
+                            *x = round as u8;
+                        }
+                    });
+                });
+                (labels_in, labels_out) = (labels_out, labels_in);
+            }
+        } else {
+            let mut labels_in = sbwt.build_last_column();
+            let mut labels_out = labels_in.clone();
+            for round in 0..k {
+                if round > 0 {
+                    log::info!("Building column {} of the SBWT matrix", k-1-round);
+                    sbwt.push_all_labels_forward(&labels_in, &mut labels_out, n_threads);
+                }
+                log::info!("Storing LCS values of {}", round);
+                thread_pool.install(||{
+                    lcs.par_iter_mut().enumerate().for_each(|(i, x)| {
+                        if *x == k as u8 && labels_out[i] != labels_out[i-1] {
+                            *x = round as u8;
+                        }
+                    });
+                });
+                (labels_in, labels_out) = (labels_out, labels_in);
+            }
+        }
+
+        log::info!("Compressing into log(k) bits per element");
+        let mut compressed_lcs = simple_sds_sbwt::int_vector::IntVector::with_capacity(sbwt.n_sets(), bit_width as usize).unwrap();
+        for x in lcs {
+            compressed_lcs.push(x as u64);
+        }
+
+        log::info!("LCS construction complete");
+
+        Self{lcs: compressed_lcs}
+
+    }
+
+}
+
+
+impl<'index, E: ExtendRight, C: ContractLeft> StreamingIndex<'index, E, C>{
+
+    /// Returns an array A of length `query.len()`, where A\[i\] is a pair (d, I) where d is the length of the shortest suffix
+    /// of `query[0..=i]` that occurs at most `freq_bound` times in the de Bruijn graph of the k-mers in the index, and
+    /// I is the colexicographic interval of that suffix. Such match may not exist, in which case A\[i\] is None.
+    /// The algorithm is described in the paper [Finimizers: Variable-length bounded-frequency minimizers for k-mer sets](https://doi.org/10.1101/2024.02.19.580943).
+    #[allow(non_snake_case)]
+    pub fn shortest_freq_bound_suffixes(&self, query: &[u8], freq_bound: usize) -> Vec<Option<(usize, std::ops::Range<usize>)>> {
+        let mut SFS = vec![None; query.len()];
+        let mut I = 0..self.n;
+        let mut d = 0_usize; // String length of interval I
+        for i in 0..query.len() {
+            if crate::util::is_dna(query[i]) {
+                let mut Ic = self.extend_right.extend_right(I.clone(), query[i]);
+                while d > 0 && Ic.is_empty() {
+                    I = self.contract_left.contract_left(I, d-1);
+                    d -= 1;
+                    Ic = self.extend_right.extend_right(I.clone(), query[i]);
+                }
+
+                if !Ic.is_empty() {
+                    I = Ic;
+                    d = std::cmp::min(self.k, d+1);
+                }
+            } else {
+                I = 0..self.n;
+                d = 0;
+            };
+
+            // Contract I to the sortest frequency-bounded suffix
+            while I.len() <= freq_bound && d > 0 {
+                let J = self.contract_left.contract_left(I.clone(), d-1);
+                if J.len() <= freq_bound {
+                    I = J;
+                    d -= 1;
+                } else {
+                    break
+                }
+            }
+
+            if I.len() <= freq_bound {
+                SFS[i] = Some((d, I.clone()));
+            }
+        }
+        SFS
+    }
+
+    /// Returns an array A of length `query.len()`, where A\[i\] is a pair (d, I) where d is the length of the longest
+    /// suffix of `query[i-k+1..=i]` that is found in the index, and I is the colexicographic interval of the match.
+    /// The algorithm is described in the paper [Finimizers: Variable-length bounded-frequency minimizers for k-mer sets](https://doi.org/10.1101/2024.02.19.580943).
+    /// For a length-bounded version, see [Self::bounded_matching_statistics].
+    #[allow(non_snake_case)]
+    pub fn matching_statistics(&self, query: &[u8]) -> Vec<(usize, std::ops::Range<usize>)> {
+        let iter = self.matching_statistics_iter(query);
+        iter.collect()
+    }
+
+    /// Returns an array A of length `query.len()`, where A\[i\] is a pair (d, I) where d is the length of the longest
+    /// suffix of `query[i-k+1..=i]` that is found in the index, *up to the given length bound*, and I is the colexicographic interval of the match.
+    /// If the length bound is significantly shorter than k, then the intervals can be very long, so the [ContractLeft] implementation
+    /// needs to have good worst-case time complexity.
+    #[allow(non_snake_case)]
+    pub fn bounded_matching_statistics(&self, query: &[u8], length_bound: usize) -> Vec<(usize, std::ops::Range<usize>)> {
+        let iter = self.bounded_matching_statistics_iter(query, length_bound);
+        iter.collect()
+    }
+
+    /// Runs one step of the matching statistic algorithm. To run the whole
+    /// algorithm, use [StreamingIndex::matching_statistics]`.
+    /// c: the next character
+    /// I: the current colex interval
+    /// d: the current match length
+    /// Returns the new match length and new colex interval
+    pub fn matching_statistics_update_step(&self, c: u8, mut I: Range<usize>, mut d: usize, length_bound: usize) -> (usize, Range<usize>) {
+        if !crate::util::is_dna(c) { // Invalid character. Attempting to right-extend would panic, and anyway
+            // we would need to contract all the way to the empty string, and that would
+            // take a long time with the current LCS-scanning implementation.
+            // So, we just reset the interval to the interval of the empty string.
+            (0, 0..self.n)
+        } else {
+            let mut Ic = self.extend_right.extend_right(I.clone(), c);
+            while d > 0 && Ic.is_empty() {
+                I = self.contract_left.contract_left(I, d-1);
+                d -= 1;
+                Ic = self.extend_right.extend_right(I.clone(), c);
+            }
+            if !Ic.is_empty() {
+                I = Ic;
+                d = std::cmp::min(self.k, d+1);
+            } else {
+                // Ic can be empty if d=0 and the extension still fails.
+                // In this case character c is not in the index at all, so
+                // I should be set to the interval of the empty string.
+                // In that case, I is already correct here, so we do not
+                // need to do anything. TODO: is this case covered by tests?
+            } 
+            while d > length_bound {
+                I = self.contract_left.contract_left(I, d-1);
+                d -= 1;
+            }
+            (d, I)
+        }
+    }
+
+    /// Returns a [MatchingStatisticsIterator] for streaming the matching statistics.
+    pub fn matching_statistics_iter<'a>(&self, query: &'a [u8]) -> MatchingStatisticsIterator<'index, 'a, E, C> {
+        self.bounded_matching_statistics_iter(query, usize::MAX)
+    }
+
+    /// Returns a [MatchingStatisticsIterator] for streaming the matching statistics with a given length bound
+    /// smaller than [Self::k()]
+    pub fn bounded_matching_statistics_iter<'a>(&self, query: &'a [u8], length_bound: usize) -> MatchingStatisticsIterator<'index, 'a, E, C> {
+        MatchingStatisticsIterator { 
+            colex_range: 0..self.n, 
+            match_len: 0, 
+            query_pos: 0,
+            streaming_index: StreamingIndex { 
+                extend_right: self.extend_right, 
+                contract_left: self.contract_left, 
+                n: self.n, k: self.k 
+            },
+            query,
+            length_bound
+        }
+    }
+
+}
+
+/// An iterator that produces values of the matching statistics one by one. Create with [StreamingIndex::matching_statistics_iter()]. Useful for
+/// streaming over the matching statistics without having to keep the values in memory all at once.
+/// Using [Iterator::collect] on the iterator will give the same vector as [StreamingIndex::matching_statistics].
+pub struct MatchingStatisticsIterator<'a, 'b, E: ExtendRight, C: ContractLeft> {
+    // Algorithm state
+    colex_range: Range<usize>,
+    match_len: usize,
+    query_pos: usize,
+
+    // Index
+    streaming_index: StreamingIndex<'a, E, C>,
+
+    // Query
+    query: &'b [u8],
+    length_bound: usize,
+}
+
+impl<E: ExtendRight, C: ContractLeft> Iterator for MatchingStatisticsIterator<'_, '_, E, C> {
+    type Item = (usize, Range<usize>); // Left, colex interval
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.query_pos < self.query.len() {
+            (self.match_len, self.colex_range) = self.streaming_index.matching_statistics_update_step(self.query[self.query_pos], self.colex_range.clone(), self.match_len, self.length_bound);
+            self.query_pos += 1;
+            Some((self.match_len, self.colex_range.clone()))
+        } else {
+            None // End of iteration
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::BitPackedKmerSortingMem;
+
+    use super::*;
+
+    #[test_log::test]
+    #[allow(non_snake_case)]
+    fn LCS_paper_example() {
+        let seqs: Vec<&[u8]> = vec![b"AGGTAAA", b"ACAGGTAGGAAAGGAAAGT"];
+
+        let (sbwt, lcs) = BitPackedKmerSortingMem::new_from_slices(&seqs, 4).build_lcs(true).run();
+        let lcs = lcs.unwrap();
+        let from_sbwt = LcsArray::from_sbwt(&sbwt, 3, false);
+
+        let true_lcs = [0,0,1,3,2,2,1,1,1,0,0,2,2,1,3,3,0,2];
+        for i in 0..lcs.len() {
+            println!("LCS {}", lcs.access(i));
+            assert_eq!(true_lcs[i], lcs.access(i));
+            assert_eq!(true_lcs[i], from_sbwt.access(i));
+        }
+
+        // Test streaming support
+        let SS = StreamingIndex::<SbwtIndex::<SubsetMatrix>, LcsArray>{contract_left: &lcs, extend_right: &sbwt, n: sbwt.n_sets(), k: sbwt.k()};
+        let mut I = 0..sbwt.sbwt.len();
+        I = SS.extend_right.extend_right(I, b'A') ;
+        I = SS.extend_right.extend_right(I, b'G') ;
+        I = SS.extend_right.extend_right(I, b'G') ;
+        assert_eq!(I, 13..16);
+
+        let I3 = SS.contract_left.contract_left(I.clone(), 3);
+        assert_eq!(I3, 13..16);
+
+        let I2 = SS.contract_left.contract_left(I.clone(), 2);
+        assert_eq!(I2, 13..16);
+
+        let I1 = SS.contract_left.contract_left(I.clone(), 1);
+        assert_eq!(I1, 10..16);
+
+        let I0 = SS.contract_left.contract_left(I.clone(), 0);
+        assert_eq!(I0, 0..18);
+        dbg!(I3, I2, I1, I0);
+
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn finimizer_paper_example(){
+
+        // This is a pretty weak test but it's something.
+        // Using the example from the finimizer paper.
+        let seqs: Vec<&[u8]> = vec![b"GTAAGTCT", b"AGGAAA", b"ACAGG", b"GTAGG", b"AGGTA"];
+        let k = 4;
+
+        let (sbwt, lcs) = BitPackedKmerSortingMem::new_from_slices(&seqs, k).build_lcs(true).run();
+        let lcs = lcs.unwrap();
+        let SS = StreamingIndex::new(&sbwt, &lcs);
+        let MS = SS.matching_statistics(b"AAGTAA");
+        eprintln!("{:?}", MS);
+        let true_MS_lengths: [usize; 6] = [1,2,3,4,3,4];
+        let true_MS_freqs: [usize; 6] = [7,3,1,1,1,1];
+        let true_MS_colex_starts: [usize; 6] = [2,3,11,17,8,5];
+        assert_eq!(MS.len(), true_MS_lengths.len());
+        for i in 0..MS.len(){
+            assert_eq!(MS[i].0, true_MS_lengths[i]);
+            assert_eq!(MS[i].1.len(), true_MS_freqs[i]);
+            assert_eq!(MS[i].1.start + 1, true_MS_colex_starts[i]); // Paper has 1-indexing
+        }
+
+        let mut SFS = SS.shortest_freq_bound_suffixes(b"AAGTAA", 1);
+
+        let true_SFS = [None, None, Some((3,11..12)), Some((3, 17..18)), Some((2, 8..9)), Some((3, 5..6))];
+
+        // Put our SFS in 1-based indexing
+        for item in SFS.iter_mut(){
+            if let Some(X) = item{
+                *item = Some((X.0, X.1.start + 1..X.1.end + 1));
+            }
+
+        }
+        eprintln!("{:?}", SFS);
+
+        assert_eq!(SFS, true_SFS);
+
+        // Let's try a query that has an invalid character
+        let mut SFS = SS.shortest_freq_bound_suffixes(b"AANAAGTAA", 1);
+
+        let true_SFS = [None, None, None, None, None, Some((3,11..12)), Some((3, 17..18)), Some((2, 8..9)), Some((3, 5..6))];
+
+        // Put our SFS in 1-based indexing
+        for item in SFS.iter_mut(){
+            if let Some(X) = item{
+                *item = Some((X.0, X.1.start + 1..X.1.end + 1));
+            }
+
+        }
+        assert_eq!(SFS, true_SFS);
+
+        eprintln!("{:?}", SFS);
+    }
+
+    #[test]
+    fn lcs_of_tiny_indexes_with_many_threads() {
+        // An index with only the root (no k-mers, e.g. an empty intersection) and indexes with
+        // fewer nodes than threads: the low-memory construction splits the nodes into one range
+        // per thread, and then the first range has no edges and the ranges after it are empty.
+        let k = 5;
+        let cases: Vec<Vec<Vec<u8>>> = vec![
+            vec![],
+            vec![b"ACGTA".to_vec()],
+            vec![b"ACGTACG".to_vec(), b"TTTTT".to_vec()],
+        ];
+        for kmers_seqs in cases {
+            let (sbwt, _) = BitPackedKmerSortingMem::new_from_vecs(&kmers_seqs, k).run();
+            let expected = LcsArray::from_sbwt(&sbwt, 1, false);
+            for n_threads in [1, 2, 3, 8, 64] {
+                for optimize_peak_ram in [false, true] {
+                    let lcs = LcsArray::from_sbwt(&sbwt, n_threads, optimize_peak_ram);
+                    assert_eq!(lcs, expected, "n_sets={} n_threads={n_threads} optimize_peak_ram={optimize_peak_ram}", sbwt.n_sets());
+                }
+            }
+        }
+    }
+}

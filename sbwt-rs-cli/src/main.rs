@@ -1,0 +1,1939 @@
+use std::cmp::max;
+use std::fs::File;
+use std::io;
+use std::io::stdout;
+use std::io::BufRead;
+use std::io::BufWriter;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use bitvec::order::Lsb0;
+use bitvec::vec::BitVec;
+use jseqio::reader::DynamicFastXReader;
+use sbwt::dbg::Dbg;
+use sbwt::sbwt_index_variant::SbwtIndexVariant;
+use sbwt::*;
+use sbwt::benchmark;
+use std::sync::Arc;
+
+mod check;
+
+struct MySeqReader {
+    inner: jseqio::reader::DynamicFastXReader,
+}
+
+impl sbwt::SeqStream for MySeqReader {
+    fn stream_next(&mut self) -> Option<&[u8]> {
+        self.inner.read_next().unwrap().map(|rec| rec.seq)
+    }
+}
+
+struct MyMultiFileSeqReader {
+    paths: Vec<PathBuf>,
+    next_idx: usize,
+    current: Option<jseqio::reader::DynamicFastXReader>,
+
+    // Need to copy sequences to a local buffer because we can't return references
+    // into the current reader because it may be freed while the caller still holds a reference.
+    local_buf: Vec<u8>, 
+}
+
+impl MyMultiFileSeqReader {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths,
+            next_idx: 0,
+            current: None,
+            local_buf: vec![]
+        }
+    }
+}
+
+impl sbwt::SeqStream for MyMultiFileSeqReader {
+    fn stream_next(&mut self) -> Option<&[u8]> {
+        loop {
+            if let Some(current) = &mut self.current {
+                if let Some(rec) = current.read_next().unwrap() {
+                    self.local_buf.clear();
+                    self.local_buf.extend_from_slice(rec.seq);
+                    return Some(&self.local_buf);
+                } else {
+                    self.current = None; // Finished current file
+                }
+            }
+
+            // Open next file if available
+            if self.next_idx < self.paths.len() {
+                let path = &self.paths[self.next_idx];
+                self.next_idx += 1;
+                self.current = Some(jseqio::reader::DynamicFastXReader::from_file(path).unwrap());
+            } else {
+                return None; // No more files
+            }
+        }
+    }
+}
+
+/// Loads an SBWT index from `path`, either in the native Rust format, or, if `cpp_format` is
+/// set, in the format used by the C++ API (which only supports the plain matrix representation).
+fn load_index(path: &std::path::Path, cpp_format: bool) -> SbwtIndexVariant {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+    if cpp_format {
+        SbwtIndexVariant::SubsetMatrix(load_from_cpp_plain_matrix_format(&mut reader).unwrap())
+    } else {
+        SbwtIndexVariant::load(&mut reader).unwrap()
+    }
+}
+
+/// The default `.lcs` path for the SBWT index file at `indexfile`
+/// (same path with the extension replaced by `.lcs`).
+fn default_lcs_path(indexfile: &std::path::Path) -> PathBuf {
+    let mut p = indexfile.to_path_buf();
+    p.set_extension("lcs");
+    p
+}
+
+/// Loads the LCS array from `lcs_path`, if it exists. If it does not, `not_found_message`
+/// is logged alongside the path to explain what happens without it.
+fn load_lcs_if_exists(lcs_path: &std::path::Path, not_found_message: &str) -> Option<LcsArray> {
+    match std::fs::File::open(lcs_path) {
+        Ok(f) => {
+            log::info!("Loading LCS array from file {}", lcs_path.display());
+            let mut lcs_reader = std::io::BufReader::new(f);
+            Some(LcsArray::load(&mut lcs_reader).unwrap())
+        }
+        Err(_) => {
+            log::info!("No LCS array found at {} -> {}", lcs_path.display(), not_found_message);
+            None
+        }
+    }
+}
+
+fn load_lcs_or_build_otherwise(lcs_path: &std::path::Path, sbwt: &SbwtIndexVariant, n_threads: usize, optimize_peak_ram: bool) -> LcsArray {
+    match std::fs::File::open(lcs_path) {
+        Ok(f) => {
+            log::info!("Loading LCS array from file {}", lcs_path.display());
+            let mut lcs_reader = std::io::BufReader::new(f);
+            LcsArray::load(&mut lcs_reader).unwrap()
+        }
+        Err(_) => {
+            log::info!("No LCS array found at {} -> building", lcs_path.display());
+            sbwt.build_lcs(n_threads, optimize_peak_ram)
+        }
+    }
+}
+
+// sbwt is taken as mutable because we need to build select support if all_at_once is true
+fn dump_kmers(sbwt: &mut SbwtIndexVariant, outfile: Option<&std::path::Path>, all_at_once: bool, include_dummies: bool, n_threads: usize) {
+    let mut fileout = outfile.map(|f| BufWriter::new(File::create(f).unwrap()));
+    let mut stdout = BufWriter::new(io::stdout());
+    if all_at_once {
+        log::info!("Reconstructing the k-mers");
+        let concat = sbwt.reconstruct_padded_spectrum(n_threads);
+        assert!(concat.len() % sbwt.k() == 0);
+
+        log::info!("Writing k-mers to output");
+        let n_padded_kmers = concat.len() / sbwt.k();
+        for i in 0..n_padded_kmers {
+            let kmer = &concat[i*sbwt.k()..(i+1)*sbwt.k()];
+            if include_dummies || kmer.iter().all(|&c| c != b'$') {
+                match fileout {
+                    Some(ref mut fileout) => {
+                        fileout.write_all(kmer).unwrap();
+                        fileout.write_all(b"\n").unwrap();
+                    },
+                    None => {
+                        stdout.write_all(kmer).unwrap();
+                        stdout.write_all(b"\n").unwrap();
+                    }
+                }
+            }
+        }
+    } else {
+        log::info!("Building select support");
+        sbwt.build_select();
+
+        log::info!("Dumping k-mers");
+        let mut buf = vec![0u8; sbwt.k() + 1];
+        for i in 0..sbwt.n_sets() {
+            buf.clear();
+            sbwt.push_kmer_to_vec(i, &mut buf);
+            buf.push(b'\n');
+            if include_dummies || buf.iter().all(|&c| c != b'$') {
+                match fileout {
+                    Some(ref mut fileout) => {
+                        fileout.write_all(&buf).unwrap();
+                    },
+                    None => {
+                        stdout.write_all(&buf).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+fn dump_kmers_command(matches: &clap::ArgMatches){
+
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let indexfile = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let include_dummies = matches.get_flag("include-dummy-kmers");
+    let all_at_once = matches.get_flag("all-at-once");
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let outfile = matches.get_one::<std::path::PathBuf>("output");
+
+    // Don't care if there is LCS support or not
+    let mut index = load_index(indexfile, cpp_format);
+
+    dump_kmers(&mut index, outfile.map(|f| &**f), all_at_once, include_dummies, n_threads);
+
+}
+
+enum InputMode {
+    SingleFile(PathBuf),
+    FileList(PathBuf),
+}
+
+fn read_lines(path: &PathBuf) -> Vec<PathBuf> {
+    let file = File::open(path).unwrap();
+    let reader = io::BufReader::new(file);
+    let mut paths = Vec::<PathBuf>::new();
+    for line in reader.lines() {
+        let line = line.unwrap();
+        paths.push(PathBuf::from(line));
+    }
+    paths
+}
+
+#[allow(non_snake_case)]
+fn build_command(matches: &clap::ArgMatches){
+
+    let infile = matches.get_one::<std::path::PathBuf>("input");
+    let in_listfile = matches.get_one::<std::path::PathBuf>("input-list");
+
+    let out_prefix = matches.get_one::<std::path::PathBuf>("output-prefix").unwrap();
+    let build_lcs = matches.get_flag("build-lcs");
+    let k = *matches.get_one::<usize>("k").unwrap();
+    let mem_gb = *matches.get_one::<usize>("mem-gb").unwrap();
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let dedup_batches = matches.get_flag("dedup-batches");
+    let in_memory = matches.get_flag("in-memory");
+    let bounded_suffix_sort = matches.get_flag("bounded-suffix-sort");
+    let bucket_sort_prefix_length = *matches.get_one::<usize>("bucket-sort-prefix-length").unwrap();
+    let stream_suffix_array_from_disk = matches.get_flag("stream-sa-from-disk");
+    #[cfg(feature = "libsais")]
+    let via_libsais = matches.get_flag("via-libsais");
+    #[cfg(not(feature = "libsais"))]
+    let via_libsais = false;
+    let add_revcomp = matches.get_flag("add-revcomp");
+    let add_all_dummy_paths = matches.get_flag("add-all-dummy-paths");
+    let precalc_length = *matches.get_one::<usize>("prefix-precalc-length").unwrap();
+    let temp_dir = matches.get_one::<std::path::PathBuf>("temp-dir").unwrap();
+
+    let input_mode = if let Some(input) = infile {
+        InputMode::SingleFile(input.clone())
+    } else if let Some(input_list) = in_listfile {
+        InputMode::FileList(input_list.clone())
+    } else {
+        panic!("Either --input or --input-list must be given");
+    };
+
+    // Using a dynamic dispatch for the reader here. Not sure if this might
+    // have a measurable performance hit? It's probably alright if the input sequences
+    // are long (100+ base pairs?), but I'm not sure about shorter sequences. We could switch 
+    //to enum dispatch or even monomorphized IO.
+    let reader: Box<dyn crate::SeqStream + Send> = match input_mode {
+        InputMode::SingleFile(path_buf) => {
+            let reader = MySeqReader{inner: jseqio::reader::DynamicFastXReader::from_file(&path_buf).unwrap()};
+            Box::new(reader)
+        }
+        InputMode::FileList(path_buf) => {
+            let paths = read_lines(&path_buf);
+            let multi_reader = MyMultiFileSeqReader::new(paths);
+            Box::new(multi_reader)
+        }
+    };
+
+    // Need to do this to be able to append .sbwt to the filename (PathBuf can only set extension, which replaces the existing one, meaning we can't stack extensions).
+    let mut sbwt_outfile = out_prefix.clone().into_os_string().into_string().unwrap();
+
+    sbwt_outfile.push_str(".sbwt");
+    log::info!("Sbwt output file: {}", sbwt_outfile);
+    let mut sbwt_out = std::io::BufWriter::new(std::fs::File::create(sbwt_outfile).unwrap()); // Open already here to fail early if problems
+
+    log::info!("Building SBWT");
+    let start_time = std::time::Instant::now();
+    let (sbwt, lcs) = if via_libsais {
+        #[cfg(feature = "libsais")]
+        {
+            let builder = BuildByLibsais::new(reader, k).stream_suffix_array_from_disk(stream_suffix_array_from_disk).temp_dir(temp_dir).n_threads(n_threads).add_rev_comp(add_revcomp).build_lcs(build_lcs).precalc_length(precalc_length).add_all_dummy_paths(add_all_dummy_paths);
+            builder.run()
+        }
+        #[cfg(not(feature = "libsais"))]
+        {
+            panic!("--via-libsais requires sbwt-cli to be built with `--features libsais`");
+        }
+    } else if bounded_suffix_sort {
+        let builder = BuildByBoundedSuffixSort::new(reader, k).prefix_length_for_bucket_sort(bucket_sort_prefix_length).stream_suffix_array_from_disk(stream_suffix_array_from_disk).temp_dir(temp_dir).n_threads(n_threads).add_rev_comp(add_revcomp).build_lcs(build_lcs).precalc_length(precalc_length).add_all_dummy_paths(add_all_dummy_paths);
+        builder.run()
+    } else if in_memory {
+        let builder = BitPackedKmerSortingMem::new(reader, k).mem_gb(mem_gb).dedup_batches(dedup_batches).n_threads(n_threads).add_rev_comp(add_revcomp).build_lcs(build_lcs).precalc_length(precalc_length).add_all_dummy_paths(add_all_dummy_paths);
+        builder.run()
+    } else {
+        let builder = BitPackedKmerSortingDisk::new(reader, k).mem_gb(mem_gb).dedup_batches(dedup_batches).temp_dir(temp_dir).n_threads(n_threads).add_rev_comp(add_revcomp).build_lcs(build_lcs).precalc_length(precalc_length).add_all_dummy_paths(add_all_dummy_paths);
+        builder.run()
+    };
+    let end_time = std::time::Instant::now();
+    log::info!("Construction finished in {:.2} seconds", (end_time - start_time).as_secs_f64());
+
+    log::info!("Serializing");
+
+    let sbwt_kmers = sbwt.n_kmers();
+    let sbwt_bytes = SbwtIndexVariant::SubsetMatrix(sbwt).serialize(&mut sbwt_out).unwrap();
+    log::info!("Wrote sbwt index: {} bytes ({:.2} bits / k-mer)", sbwt_bytes, sbwt_bytes as f64 * 8.0 / sbwt_kmers as f64);
+
+    if let Some(lcs) = lcs{
+        let mut lcs_outfile = out_prefix.clone().into_os_string().into_string().unwrap(); // See comment on sbwt_outfile above
+        lcs_outfile.push_str(".lcs");
+        let mut lcs_out = std::io::BufWriter::new(std::fs::File::create(&lcs_outfile).unwrap());
+        log::info!("Lcs output file: {}", lcs_outfile);
+
+        let lcs_bytes = lcs.serialize(&mut lcs_out).unwrap();
+        log::info!("Wrote lcs array: {} bytes ({:.2} bits / k-mer)", lcs_bytes, lcs_bytes as f64 * 8.0 / sbwt_kmers as f64);
+    }
+}
+
+fn build_list_kmers_on_disk_command(matches: &clap::ArgMatches){
+
+    let infile = matches.get_one::<std::path::PathBuf>("input");
+    let in_listfile = matches.get_one::<std::path::PathBuf>("input-list");
+
+    let k = *matches.get_one::<usize>("k").unwrap();
+    let mem_gb = *matches.get_one::<usize>("mem-gb").unwrap();
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let dedup_batches = matches.get_flag("dedup-batches");
+    let add_all_dummy_paths = matches.get_flag("add-all-dummy-paths");
+    let temp_dir = matches.get_one::<std::path::PathBuf>("temp-dir").unwrap();
+
+    let input_mode = if let Some(input) = infile {
+        InputMode::SingleFile(input.clone())
+    } else if let Some(input_list) = in_listfile {
+        InputMode::FileList(input_list.clone())
+    } else {
+        panic!("Either --input or --input-list must be given");
+    };
+
+    log::info!("Sorting and deduplicating k-mers to disk");
+    let start_time = std::time::Instant::now();
+
+    let (kmers_file, first_mers_file) = match input_mode {
+        InputMode::SingleFile(path_buf) => {
+            let reader = MySeqReader{inner: jseqio::reader::DynamicFastXReader::from_file(&path_buf).unwrap()};
+            sort_and_dedup_kmers_into_file::<SubsetMatrix, _>(reader, k, mem_gb, n_threads, dedup_batches, add_all_dummy_paths, temp_dir)
+        }
+        InputMode::FileList(path_buf) => {
+            let paths = read_lines(&path_buf);
+            let multi_reader = MyMultiFileSeqReader::new(paths);
+            sort_and_dedup_kmers_into_file::<SubsetMatrix, _>(multi_reader, k, mem_gb, n_threads, dedup_batches, add_all_dummy_paths, temp_dir)
+        }
+    };
+
+    let end_time = std::time::Instant::now();
+    log::info!("Finished in {:.2} seconds", (end_time - start_time).as_secs_f64());
+
+    log::info!("Wrote k-mers file: {}", kmers_file.display());
+    println!("{}", kmers_file.display());
+    if let Some(first_mers_file) = &first_mers_file {
+        log::info!("Wrote first-mers file: {}", first_mers_file.display());
+        println!("{}", first_mers_file.display());
+    }
+}
+
+fn build_from_kmers_on_disk_command(matches: &clap::ArgMatches){
+
+    let kmers_file = matches.get_one::<std::path::PathBuf>("kmers-file").unwrap();
+    let first_mers_file = matches.get_one::<std::path::PathBuf>("first-mers-file");
+    let out_prefix = matches.get_one::<std::path::PathBuf>("output-prefix").unwrap();
+    let build_lcs = matches.get_flag("build-lcs");
+    let k = *matches.get_one::<usize>("k").unwrap();
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let temp_dir = matches.get_one::<std::path::PathBuf>("temp-dir").unwrap();
+
+    // Need to do this to be able to append .sbwt to the filename (PathBuf can only set extension, which replaces the existing one, meaning we can't stack extensions).
+    let mut sbwt_outfile = out_prefix.clone().into_os_string().into_string().unwrap();
+
+    sbwt_outfile.push_str(".sbwt");
+    log::info!("Sbwt output file: {}", sbwt_outfile);
+    let mut sbwt_out = std::io::BufWriter::new(std::fs::File::create(sbwt_outfile).unwrap()); // Open already here to fail early if problems
+
+    log::info!("Building SBWT from k-mers on disk");
+    let start_time = std::time::Instant::now();
+
+    let (sbwt, lcs) = build_from_kmers_on_disk::<SubsetMatrix>(k, n_threads, build_lcs, temp_dir, kmers_file, first_mers_file.map(|p| p.as_path()));
+
+    let end_time = std::time::Instant::now();
+    log::info!("Construction finished in {:.2} seconds", (end_time - start_time).as_secs_f64());
+
+    log::info!("Serializing");
+
+    let sbwt_kmers = sbwt.n_kmers();
+    let sbwt_bytes = SbwtIndexVariant::SubsetMatrix(sbwt).serialize(&mut sbwt_out).unwrap();
+    log::info!("Wrote sbwt index: {} bytes ({:.2} bits / k-mer)", sbwt_bytes, sbwt_bytes as f64 * 8.0 / sbwt_kmers as f64);
+
+    if let Some(lcs) = lcs{
+        let mut lcs_outfile = out_prefix.clone().into_os_string().into_string().unwrap(); // See comment on sbwt_outfile above
+        lcs_outfile.push_str(".lcs");
+        let mut lcs_out = std::io::BufWriter::new(std::fs::File::create(&lcs_outfile).unwrap());
+        log::info!("Lcs output file: {}", lcs_outfile);
+
+        let lcs_bytes = lcs.serialize(&mut lcs_out).unwrap();
+        log::info!("Wrote lcs array: {} bytes ({:.2} bits / k-mer)", lcs_bytes, lcs_bytes as f64 * 8.0 / sbwt_kmers as f64);
+    }
+}
+
+fn build_lcs_command(matches: &clap::ArgMatches) {
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let indexfile = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let low_ram = matches.get_flag("low-ram");
+    let outfile = matches.get_one::<std::path::PathBuf>("output");
+    let outfile = match outfile {
+        Some(out) => out.clone(),
+        None => default_lcs_path(indexfile),
+    };
+
+    log::info!("The LCS array will be saved to {}", outfile.display());
+
+    let mut out = BufWriter::new(File::create(&outfile).unwrap());
+
+    // Read sbwt
+    log::info!("Loading the SBWT from {}", indexfile.display());
+    let index = load_index(indexfile, cpp_format);
+
+    log::info!("Computing the LCS array");
+    let lcs = index.build_lcs(n_threads, low_ram);
+
+    log::info!("Writing to {}", outfile.display());
+    let n_bytes = lcs.serialize(&mut out).unwrap();
+
+    log::info!("{} bytes written", n_bytes);
+
+}
+
+fn report_lookup_results<W: Write>(out: &mut W, colex_ranks: &[Option<usize>], membership_only: bool){
+    // Reporting
+    if membership_only {
+        let mut out_buf = Vec::<u8>::with_capacity(colex_ranks.len() + 1); // +1 for newline at the end
+        for r in colex_ranks {
+            if r.is_some() {
+                out_buf.push(b'1');
+            } else {
+                out_buf.push(b'0');
+            }
+        }
+        out_buf.push(b'\n');
+        out.write_all(&out_buf).unwrap();
+    } else {
+        let mut number_ascii_buffer = [0u8; 32]; // Enough space for the ascii representation of a 64-bit integer
+        for (i, r) in colex_ranks.iter().enumerate() {
+            if i > 0 {
+                out.write_all(b" ").unwrap();
+            }
+            let ascii_len = if let Some(r) = r {
+                usize_to_ascii(*r, &mut number_ascii_buffer)
+            } else {
+                number_ascii_buffer[0] = b'-';
+                number_ascii_buffer[1] = b'1';
+                2
+            };
+            out.write_all(&number_ascii_buffer[0..ascii_len]).unwrap();
+        }
+        out.write_all(b"\n").unwrap();
+    }
+}
+
+// Pushes results to output vector
+#[allow(non_snake_case)]
+fn non_streaming_search<SS: SubsetSeq>(sbwt: &SbwtIndex<SS>, query: &[u8], output: &mut Vec<Option<usize>>){
+    for kmer in query.windows(sbwt.k()){
+        let r = sbwt.search(kmer).map(|I| {
+            assert!(I.len() == 1);
+            I.start
+        });
+        output.push(r);
+    }
+}
+
+// Pushes results to output vector
+#[allow(non_snake_case)]
+fn streaming_search<SS: SubsetSeq>(ss: &StreamingIndex<SbwtIndex<SS>, LcsArray>, k: usize, query: &[u8], output: &mut Vec<Option<usize>>){
+    // Query using matching statistics
+    let ms = ss.matching_statistics(query);
+    for (len, I) in ms.iter().skip(k-1) {
+        if *len == k {
+            assert!(I.len() == 1);
+            output.push(Some(I.start));
+        } else {
+            output.push(None);
+        }
+    }
+}
+
+// Writes to stdout if the outfile is not given
+// We take the index as a trait instead of the SbwtIndexVariant enum because
+// the lookups call the index in a tight loop to do the right extension and
+// we don't want a match statement in there to select the right index variant every time.
+fn lookup_query<SS: SubsetSeq>(sbwt: &SbwtIndex<SS>, lcs: Option<LcsArray>, queryfile: &std::path::Path, outfile: Option<&std::path::Path>, membership_only: bool) {
+    log::info!("k = {}, precalc length = {}, # kmers = {}, # sbwt sets = {}", sbwt.k(), sbwt.get_lookup_table().prefix_length, sbwt.n_kmers(), sbwt.n_sets());
+
+    let mut query_reader = DynamicFastXReader::from_file(&queryfile).unwrap();
+    let mut out = outfile.map(|f| std::io::BufWriter::new(std::fs::File::create(f).unwrap()));
+    let mut stdout = stdout();
+
+    let streaming_index = lcs.as_ref().map(|lcs| StreamingIndex::new(sbwt, lcs)); 
+
+    let start_time = std::time::Instant::now();
+    let mut n_query_kmers = 0_usize;
+    let mut n_found = 0_usize;
+    let mut colex_ranks = Vec::<Option<usize>>::new();
+    while let Some(rec) = query_reader.read_next().unwrap(){
+        let seq = rec.seq;
+        colex_ranks.clear();
+
+        if let Some(streaming_index) = &streaming_index{
+            streaming_search(streaming_index, sbwt.k(), seq, &mut colex_ranks);
+        } else {
+            non_streaming_search(sbwt, seq, &mut colex_ranks);
+        };
+        n_query_kmers += colex_ranks.len();
+        n_found += colex_ranks.iter().fold(0_usize, |count, r| count + r.is_some() as usize);
+
+        match out {
+            Some(ref mut out) => report_lookup_results(out, &colex_ranks, membership_only),
+            None => report_lookup_results(&mut stdout, &colex_ranks, membership_only)
+        }
+
+        colex_ranks.clear();
+
+    }
+    let end_time = std::time::Instant::now();
+    let elapsed = end_time - start_time;
+    log::info!("Queried {} k-mers", n_query_kmers);
+    log::info!("{:.2}% of queried k-mers found", n_found as f64 / n_query_kmers as f64 * 100.0);
+    log::info!("Elapsed time: {:.2} seconds ({:.2} ns / k-mer)", elapsed.as_secs_f64(), elapsed.as_nanos() as f64 / n_query_kmers as f64);
+
+}
+
+#[allow(non_snake_case)]
+fn lookup_query_command(matches: &clap::ArgMatches){
+    let indexfile = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let outfile = matches.get_one::<std::path::PathBuf>("output");
+    let queryfile = matches.get_one::<std::path::PathBuf>("query").unwrap();
+    let lcs_filename = matches.get_one::<std::path::PathBuf>("lcs-file");
+    let membership_only = matches.get_flag("membership-only");
+    let cpp_format = matches.get_flag("load-cpp-format");
+
+    // Read sbwt
+    let index = load_index(indexfile, cpp_format);
+
+    // Load the lcs array either from the given path, or by modifying the
+    // file extension of the sbwt file, if available.
+
+    let lcs_reader = match lcs_filename {
+        Some(f) => {
+            log::info!("Loading LCS array from file {}", f.display());
+            Some(std::io::BufReader::new(File::open(f).unwrap()))
+        },
+        None => {
+            // Try reading from the default filename
+            let p = default_lcs_path(indexfile);
+            log::info!("Attempting locate the LCS array file from default filename {} (use --lcs-file to change)", p.display());
+            match File::open(&p) {
+                Ok(f) => {
+                    Some(std::io::BufReader::new(f))
+                },
+                Err(_) => {
+                    log::info!("No file found at {} -> running without LCS support", p.display());
+                    None 
+                }
+            }
+        }
+    };
+    
+    let lcs = match lcs_reader {
+        Some(mut r) => {
+            log::info!("Loading LCS array");
+            Some(LcsArray::load(&mut r).unwrap())
+        },
+        None => {
+            log::info!("No LCS array found -> running without LCS support");
+            None
+        }
+    };
+
+    // We upwrap the enum here already to avoid having to do this every time in a tight inner loop during lookup.
+    match index {
+        SbwtIndexVariant::SubsetMatrix(sbwt) => lookup_query(&sbwt, lcs, queryfile, outfile.map(|v| &**v), membership_only),
+        SbwtIndexVariant::SubsetCorrectionSets(sbwt) => lookup_query(&sbwt, lcs, queryfile, outfile.map(|v| &**v), membership_only),
+    }
+}
+
+// Return the number of bytes written
+fn usize_to_ascii(mut x: usize, bytes: &mut[u8; 32]) -> usize {
+    if x == 0 {
+        bytes[0] = b'0';
+        return 1;
+    }
+
+    let mut byte_idx = 0_usize;
+    while x > 0 {
+        bytes[byte_idx] = b'0' + (x % 10) as u8;
+        byte_idx += 1;
+        x /= 10;
+    }
+    bytes[0..byte_idx].reverse();
+    byte_idx
+}
+
+fn matching_statistics<SS: SubsetSeq>(sbwt: &SbwtIndex<SS>, lcs: &LcsArray, queryfile: &std::path::Path, outfile: Option<&std::path::Path>) {
+    let mut query_reader = DynamicFastXReader::from_file(&queryfile).unwrap();
+    let mut out = outfile.map(|f| std::io::BufWriter::new(std::fs::File::create(f).unwrap()));
+    let mut stdout = stdout();
+
+    let streaming_index = StreamingIndex::new(sbwt, lcs);
+
+    let mut total_query_length = 0_usize;
+    let mut out_buffer = Vec::<u8>::new();
+    let mut number_ascii_buffer = [0u8; 32]; // Enough space for the ascii representation of a 64-bit integer
+    let mut elapsed_without_io = std::time::Duration::from_nanos(0);
+    let start_time = std::time::Instant::now();
+    while let Some(rec) = query_reader.read_next().unwrap(){
+        total_query_length += rec.seq.len();
+        let ms_start_time = std::time::Instant::now();
+
+        let ms = streaming_index.matching_statistics(rec.seq);
+
+        let ms_end_time = std::time::Instant::now();
+        elapsed_without_io += ms_end_time - ms_start_time;
+
+        out_buffer.clear();
+        for (i, (len, colex_range)) in ms.iter().enumerate(){
+            if i > 0 {
+                out_buffer.push(b',');
+            }
+            out_buffer.push(b'(');
+            let ascii_length = usize_to_ascii(*len, &mut number_ascii_buffer);
+            out_buffer.extend(&number_ascii_buffer[0..ascii_length]);
+            out_buffer.push(b',');
+            let ascii_colex_start_length = usize_to_ascii(colex_range.start, &mut number_ascii_buffer);
+            out_buffer.extend(&number_ascii_buffer[0..ascii_colex_start_length]);
+            out_buffer.push(b'.');
+            out_buffer.push(b'.');
+            let ascii_colex_end_length = usize_to_ascii(colex_range.end, &mut number_ascii_buffer);
+            out_buffer.extend(&number_ascii_buffer[0..ascii_colex_end_length]);
+            out_buffer.push(b')');
+        }
+
+        out_buffer.push(b'\n');
+
+        match out {
+            Some(ref mut out) => out.write_all(out_buffer.as_slice()).unwrap(),
+            None => stdout.write_all(out_buffer.as_slice()).unwrap(),
+        }
+    }
+
+    let total_elapsed = std::time::Instant::now() - start_time;
+    log::info!("Total query length: {} nucleotides", total_query_length);
+    log::info!("Elapsed time: {:.2} seconds ({:.2} ns / nucleotide)", total_elapsed.as_secs_f64(), total_elapsed.as_nanos() as f64 / total_query_length as f64);
+    log::info!("Elapsed time excluding I/O: {:.2} seconds ({:.2} ns / nucleotide)", elapsed_without_io.as_secs_f64(), elapsed_without_io.as_nanos() as f64 / total_query_length as f64);
+
+}
+
+fn matching_statistics_command(matches: &clap::ArgMatches){
+    let indexfile = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let lcs_filename = matches.get_one::<std::path::PathBuf>("lcs-file");
+    let outfile = matches.get_one::<std::path::PathBuf>("output");
+    let queryfile = matches.get_one::<std::path::PathBuf>("query").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+
+    // Read sbwt
+    log::info!("Loading sbwt index from file {}", indexfile.display());
+    let index = load_index(indexfile, cpp_format);
+
+    // Load the lcs array either from the given path, or by modifying the
+    // file extension of the sbwt file.
+    let lcsfile = lcs_filename.map(|f| {
+        log::info!("Loading LCS array filename {}", f.display());
+        f.to_owned()
+    }).unwrap_or_else(|| {
+        let p = default_lcs_path(indexfile);
+        log::info!("Loading LCS array from default filename {} (use --lcs-file to change)", p.display());
+        p
+    });
+
+    let lcs = match std::fs::File::open(&lcsfile) {
+        Ok(f) => {
+            let mut lcs_reader = std::io::BufReader::new(f);
+            LcsArray::load(&mut lcs_reader).unwrap()
+        }
+        Err(_) => {
+            log::error!("No LCS array found at {}", lcsfile.display());
+            log::error!("LCS array required for matching statistics (--build-lcs in index construction)");
+            return
+        }
+    };
+
+    // We unwrap the enum here already to avoid having to unwrap it in a tight loop
+    match index {
+        SbwtIndexVariant::SubsetMatrix(sbwt) => {
+            matching_statistics(&sbwt, &lcs, queryfile, outfile.map(|v| v.as_path()))
+        },
+        SbwtIndexVariant::SubsetCorrectionSets(sbwt) => {
+            matching_statistics(&sbwt, &lcs, queryfile, outfile.map(|v| v.as_path()))
+        }
+    };
+
+}
+
+fn benchmark<SS: SubsetSeq, W: Write>(sbwt: SbwtIndex<SS>, lcs: Option<LcsArray>, json_out: Option<&mut W>) {
+    log::info!("benchmarking index with k = {}, precalc length = {}, # kmers = {}, # sbwt sets = {}", sbwt.k(), sbwt.get_lookup_table().prefix_length, sbwt.n_kmers(), sbwt.n_sets());
+    let results = benchmark::benchmark_all(sbwt, lcs);
+
+    // Write results in json if requested
+    if let Some(out) = json_out {
+        let json = serde_json::to_string(&results).unwrap();
+        out.write_all(json.as_bytes()).unwrap();
+        out.write_all(b"\n").unwrap();
+    };
+}
+
+fn benchmark_command(matches: &clap::ArgMatches) {
+    let indexfile = matches.get_one::<PathBuf>("index").unwrap();
+    let precalc_length = matches.get_one::<usize>("prefix-precalc-length");
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let json_outfile = matches.get_one::<PathBuf>("json-out");
+
+    // Read sbwt
+    let mut index = load_index(indexfile, cpp_format);
+
+    // Load the lcs array, if available
+    let lcs = load_lcs_if_exists(&default_lcs_path(indexfile), "running without LCS support");
+
+    let mut json_out = json_outfile.map(|path| File::create(path).unwrap());
+
+    if let Some(p) = precalc_length {
+        log::info!("Rebuilding the precalc table with prefix length {}", p);
+        let new_table = index.build_lookup_table(*p);
+        index.set_lookup_table(new_table);
+    }
+
+    // We unwrap the enum here to avoid unwrapping in a tight inner loop.
+    match index {
+        SbwtIndexVariant::SubsetMatrix(sbwt) => {
+            benchmark(sbwt, lcs, json_out.as_mut());
+        },
+        SbwtIndexVariant::SubsetCorrectionSets(sbwt) => {
+            benchmark(sbwt, lcs, json_out.as_mut());
+        }
+    };
+}
+
+fn dump_unitigs<SS: SubsetSeq + Send + Sync>(sbwt: &mut SbwtIndex<SS>, outfile: Option<&std::path::Path>, lcs: &Option<LcsArray>, n_threads: usize) {
+    let stdout = std::io::stdout();
+    let stdout = std::io::BufWriter::new(stdout);
+    let mut fileout = outfile.map(|f| BufWriter::new(File::create(f).unwrap()));
+
+    log::info!("Preparing the de Bruijn graph");
+    sbwt.build_select();
+
+    let dbg = Dbg::new(sbwt, lcs.as_ref(), n_threads);
+
+    log::info!("Dumping unitigs");
+    match fileout {
+        Some(ref mut fileout) => dbg.parallel_export_unitigs(fileout, n_threads),
+        None => dbg.parallel_export_unitigs(stdout, n_threads),
+    }
+}
+
+fn dump_unitigs_command(matches: &clap::ArgMatches) {
+
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let indexfile = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let outfile = matches.get_one::<std::path::PathBuf>("output");
+
+    // Read sbwt
+    let index = load_index(indexfile, cpp_format);
+
+    // Load the lcs array, if available
+    let lcs = load_lcs_if_exists(&default_lcs_path(indexfile), "some extra computation needed to initialize the DBG");
+
+    // We unwrap the enum here because Dbg<...> needs a concrete SubsetSeq type
+    match index {
+        SbwtIndexVariant::SubsetMatrix(mut sbwt) => {
+            dump_unitigs(&mut sbwt, outfile.map(|f| &**f), &lcs, n_threads);
+        },
+        SbwtIndexVariant::SubsetCorrectionSets(mut sbwt) => {
+            dump_unitigs(&mut sbwt, outfile.map(|f| &**f), &lcs, n_threads);
+        }
+    };
+
+}
+
+// Resolves the prefix lookup table length to use for the result of a set operation on
+// index1 and index2, warning if the two inputs disagree.
+fn resolve_lut_len<SS: SubsetSeq>(index1: &SbwtIndex<SS>, index2: &SbwtIndex<SS>) -> usize {
+    let lut_len1 = index1.get_lookup_table().prefix_length;
+    let lut_len2 = index2.get_lookup_table().prefix_length;
+    let lut_len = max(lut_len1, lut_len2);
+
+    if lut_len1 != lut_len2 {
+        log::warn!("Different lookup table prefix lengths: {} {}", lut_len1, lut_len2);
+        log::warn!("Using length {} for the resulting index", lut_len);
+    }
+
+    lut_len
+}
+
+fn run_merge<SS: SubsetSeq + Send + Sync>(index1: SbwtIndex<SS>, index2: SbwtIndex<SS>, low_ram: bool, keep_redundant_dummies: bool, n_threads: usize) -> SbwtIndex<SS> {
+    let lut_len = resolve_lut_len(&index1, &index2);
+
+    log::info!("Computing the merge interleaving (low-ram mode: {})", low_ram);
+    let interl = MergeInterleaving::new(&index1, &index2, low_ram, n_threads);
+    log::info!("Executing the merge");
+    if keep_redundant_dummies {
+        merge_without_cleanup(Arc::new(index1), Arc::new(index2), Arc::new(interl), lut_len, n_threads)
+    } else {
+        merge(Arc::new(index1), Arc::new(index2), Arc::new(interl), lut_len, n_threads)
+    }
+}
+
+fn merge_command(matches: &clap::ArgMatches) {
+
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let sbwt1_path = matches.get_one::<std::path::PathBuf>("sbwt1").unwrap();
+    let sbwt2_path = matches.get_one::<std::path::PathBuf>("sbwt2").unwrap();
+    let sbwt_outfile = matches.get_one::<std::path::PathBuf>("output").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let low_ram = matches.get_flag("low-ram");
+    let keep_redundant_dummies = matches.get_flag("keep-redundant-dummies");
+
+    // Open output file (open early to fail early if there is a problem)
+    let mut out = BufWriter::new(File::create(sbwt_outfile).unwrap());
+
+    // Read sbwts
+    let index1 = load_index(sbwt1_path, cpp_format);
+    let index2 = load_index(sbwt2_path, cpp_format);
+
+    // To avoid variants^2 match arms, we require that both indices have the same SubsetSeq implementation.
+    match (index1, index2) {
+        (SbwtIndexVariant::SubsetMatrix(sbwt1), SbwtIndexVariant::SubsetMatrix(sbwt2)) => {
+            let merged = run_merge(sbwt1, sbwt2, low_ram, keep_redundant_dummies, n_threads);
+            log::info!("Serializing to {}", sbwt_outfile.display());
+            SbwtIndexVariant::SubsetMatrix(merged).serialize(&mut out).unwrap();
+            log::info!("Finished");
+        },
+        (SbwtIndexVariant::SubsetCorrectionSets(sbwt1), SbwtIndexVariant::SubsetCorrectionSets(sbwt2)) => {
+            let merged = run_merge(sbwt1, sbwt2, low_ram, keep_redundant_dummies, n_threads);
+            log::info!("Serializing to {}", sbwt_outfile.display());
+            SbwtIndexVariant::SubsetCorrectionSets(merged).serialize(&mut out).unwrap();
+            log::info!("Finished");
+        },
+        _ => {
+            panic!("SBWT merge requires that both indices have the same SubsetSeq implementation")
+        }
+    };
+}
+
+fn run_intersect<SS: SubsetSeq + Send + Sync + Clone>(index1: SbwtIndex<SS>, index2: SbwtIndex<SS>, low_ram: bool, n_threads: usize) -> SbwtIndex<SS> {
+    let lut_len = resolve_lut_len(&index1, &index2);
+
+    log::info!("Computing the merge interleaving (low-ram mode: {})", low_ram);
+    let interl = MergeInterleaving::new(&index1, &index2, low_ram, n_threads);
+    log::info!("Executing the intersection");
+    intersect(Arc::new(index1), Arc::new(index2), Arc::new(interl), lut_len, low_ram, n_threads)
+        .unwrap_or_else(|e| panic!("{e:?}"))
+}
+
+fn intersect_command(matches: &clap::ArgMatches) {
+
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let sbwt1_path = matches.get_one::<std::path::PathBuf>("sbwt1").unwrap();
+    let sbwt2_path = matches.get_one::<std::path::PathBuf>("sbwt2").unwrap();
+    let sbwt_outfile = matches.get_one::<std::path::PathBuf>("output").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let low_ram = matches.get_flag("low-ram");
+
+    // Open output file early to fail fast if path is invalid
+    let mut out = BufWriter::new(File::create(sbwt_outfile).unwrap());
+
+    // Read both indexes
+    let mut index1 = load_index(sbwt1_path, cpp_format);
+    index1.build_select();
+    let index2 = load_index(sbwt2_path, cpp_format);
+
+    // To avoid variants^2 match arms, we require that both indices have the same SubsetSeq implementation.
+    match (index1, index2) {
+        (SbwtIndexVariant::SubsetMatrix(sbwt1), SbwtIndexVariant::SubsetMatrix(sbwt2)) => {
+            let result = run_intersect(sbwt1, sbwt2, low_ram, n_threads);
+            log::info!("Serializing to {}", sbwt_outfile.display());
+            SbwtIndexVariant::SubsetMatrix(result).serialize(&mut out).unwrap();
+            log::info!("Finished");
+        },
+        (SbwtIndexVariant::SubsetCorrectionSets(sbwt1), SbwtIndexVariant::SubsetCorrectionSets(sbwt2)) => {
+            let result = run_intersect(sbwt1, sbwt2, low_ram, n_threads);
+            log::info!("Serializing to {}", sbwt_outfile.display());
+            SbwtIndexVariant::SubsetCorrectionSets(result).serialize(&mut out).unwrap();
+            log::info!("Finished");
+        },
+        _ => {
+            panic!("SBWT intersection requires that both indices have the same SubsetSeq implementation")
+        }
+    };
+}
+
+fn run_difference<SS: SubsetSeq + Send + Sync + Clone>(index1: SbwtIndex<SS>, index2: SbwtIndex<SS>, low_ram: bool, n_threads: usize) -> SbwtIndex<SS> {
+    let lut_len = resolve_lut_len(&index1, &index2);
+
+    log::info!("Computing the merge interleaving (low-ram mode: {})", low_ram);
+    let interl = MergeInterleaving::new(&index1, &index2, low_ram, n_threads);
+    log::info!("Executing the difference (index1 \\ index2)");
+    difference(Arc::new(index1), Arc::new(index2), Arc::new(interl), lut_len, low_ram, n_threads)
+        .unwrap_or_else(|e| panic!("{e:?}"))
+}
+
+fn difference_command(matches: &clap::ArgMatches) {
+
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let sbwt1_path = matches.get_one::<std::path::PathBuf>("sbwt1").unwrap();
+    let sbwt2_path = matches.get_one::<std::path::PathBuf>("sbwt2").unwrap();
+    let sbwt_outfile = matches.get_one::<std::path::PathBuf>("output").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let low_ram = matches.get_flag("low-ram");
+
+    let mut out = BufWriter::new(File::create(sbwt_outfile).unwrap());
+
+    let mut index1 = load_index(sbwt1_path, cpp_format);
+    index1.build_select(); // Required for difference
+    let index2 = load_index(sbwt2_path, cpp_format);
+
+    // To avoid variants^2 match arms, we require that both indices have the same SubsetSeq implementation.
+    match (index1, index2) {
+        (SbwtIndexVariant::SubsetMatrix(sbwt1), SbwtIndexVariant::SubsetMatrix(sbwt2)) => {
+            let result = run_difference(sbwt1, sbwt2, low_ram, n_threads);
+            log::info!("Serializing to {}", sbwt_outfile.display());
+            SbwtIndexVariant::SubsetMatrix(result).serialize(&mut out).unwrap();
+            log::info!("Finished");
+        },
+        (SbwtIndexVariant::SubsetCorrectionSets(sbwt1), SbwtIndexVariant::SubsetCorrectionSets(sbwt2)) => {
+            let result = run_difference(sbwt1, sbwt2, low_ram, n_threads);
+            log::info!("Serializing to {}", sbwt_outfile.display());
+            SbwtIndexVariant::SubsetCorrectionSets(result).serialize(&mut out).unwrap();
+            log::info!("Finished");
+        },
+        _ => {
+            panic!("SBWT difference requires that both indices have the same SubsetSeq implementation")
+        }
+    };
+}
+
+fn run_jaccard<SS: SubsetSeq + Send + Sync>(index1: SbwtIndex<SS>, index2: SbwtIndex<SS>, low_ram: bool, n_threads: usize) {
+    let interl = MergeInterleaving::new(&index1, &index2, low_ram, n_threads);
+
+    let intersection = interl.intersection_size();
+    let union = interl.union_size();
+    let jaccard = intersection as f64 / union as f64;
+    println!("Intersection size: {}", intersection);
+    println!("Union size: {}", union);
+    println!("Jaccard index: {}", jaccard);
+}
+
+fn jaccard_command(matches: &clap::ArgMatches) {
+
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+    let sbwt1_path = matches.get_one::<std::path::PathBuf>("sbwt1").unwrap();
+    let sbwt2_path = matches.get_one::<std::path::PathBuf>("sbwt2").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let low_ram = matches.get_flag("low-ram");
+
+    // Read sbwts
+    let index1 = load_index(sbwt1_path, cpp_format);
+    let index2 = load_index(sbwt2_path, cpp_format);
+
+    // To avoid variants^2 match arms, we require that both indices have the same SubsetSeq implementation.
+    match (index1, index2) {
+        (SbwtIndexVariant::SubsetMatrix(sbwt1), SbwtIndexVariant::SubsetMatrix(sbwt2)) => {
+            run_jaccard(sbwt1, sbwt2, low_ram, n_threads);
+        },
+        (SbwtIndexVariant::SubsetCorrectionSets(sbwt1), SbwtIndexVariant::SubsetCorrectionSets(sbwt2)) => {
+            run_jaccard(sbwt1, sbwt2, low_ram, n_threads);
+        },
+        _ => {
+            panic!("SBWT jaccard requires that both indices have the same SubsetSeq implementation")
+        }
+    };
+}
+
+fn kmer_at_rank_command(matches: &clap::ArgMatches) {
+    let indexfile = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let rank = *matches.get_one::<usize>("rank").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+
+    let mut sbwt = load_index(indexfile, cpp_format);
+
+    if rank >= sbwt.n_sets() {
+        eprintln!("Error: rank {} is out of bounds (index has {} sets)", rank, sbwt.n_sets());
+        std::process::exit(1);
+    }
+    log::info!("Building select support");
+    sbwt.build_select();
+    let mut buf = Vec::<u8>::with_capacity(sbwt.k() + 1);
+    sbwt.push_kmer_to_vec(rank, &mut buf);
+    buf.push(b'\n');
+    std::io::stdout().write_all(&buf).unwrap();
+}
+
+fn check_command(matches: &clap::ArgMatches) {
+    let index_path = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let invariant_check = matches.get_flag("invariant");
+    let original_sequences = matches.get_one::<std::path::PathBuf>("original-sequences");
+    let add_revcomp = matches.get_flag("add-revcomp");
+
+    check::run_check(index_path, cpp_format, invariant_check, original_sequences, add_revcomp);
+}
+#[derive(Debug)]
+pub struct TempFilePath {
+    path: PathBuf,
+    delete_on_drop: bool,
+}
+
+impl Drop for TempFilePath {
+    fn drop(&mut self) {
+        if self.delete_on_drop {
+            log::trace!("Dropping temp file {}", self.path.display());
+            std::fs::remove_file(&self.path).unwrap();
+        } else {
+            log::trace!("Keeping temp file {} on drop", self.path.display());
+        }
+    }
+}
+
+impl TempFilePath {
+
+    // Does not check if the filename is taken
+    fn pick_random_filename(dir: &Path, prefix: &str, random_infix_length: usize, suffix: &str) -> PathBuf {
+        let mut random_part = String::new();
+        for _ in 0..random_infix_length {
+            let r = rand::random_range(0..26);
+            let c = b'a' + r; // Random character from a..z
+            random_part.push(c as char);
+        }
+
+        let mut fname = String::new();
+        fname.push_str(prefix);
+        fname.push_str(&random_part);
+        fname.push_str(suffix);
+
+        let mut path = dir.to_path_buf();
+        path.push(fname);
+        path
+    }
+
+    // Pick random filenames with the given parameters until it finds one that is free
+    fn new(dir: &Path, prefix: &str, random_infix_length: usize, suffix: &str, delete_on_drop: bool) -> Self {
+        let mut path = Self::pick_random_filename(dir, prefix, random_infix_length, suffix);
+        let mut file = std::fs::File::create_new(&path);
+
+        while let Err(e) = file {
+            match e.kind() {
+                std::io::ErrorKind::AlreadyExists => {
+                    // Try again
+                    log::warn!("Temporary filename collision {}, trying again...", path.display());
+                    path = Self::pick_random_filename(dir, prefix, random_infix_length, suffix);
+                    file = std::fs::File::create_new(&path);
+
+                },
+                _ => panic!("Error creating temp file: {} {}", path.display(), e),
+            }
+        }
+
+        log::trace!("Creating temp file {}", path.display());
+        Self{ path, delete_on_drop }
+
+    }
+}
+
+fn unitigs_to_tempfile(index: &mut SbwtIndexVariant, lcs: &LcsArray, temp_dir: &Path, n_threads: usize, delete_on_drop: bool) -> TempFilePath {
+    std::fs::create_dir_all(temp_dir).expect("failed to create --temp-dir");
+    let unitigs_path = TempFilePath::new(temp_dir, "unitigs", 8, ".fna", delete_on_drop);
+    log::info!("Exporting unitigs of to {}", unitigs_path.path.display());
+    let mut unitigs_out = BufWriter::new(File::create(&unitigs_path.path).unwrap());
+    index.parallel_export_unitigs(&mut unitigs_out, Some(lcs), n_threads);
+    unitigs_path
+}
+
+fn check_set_operation_command(matches: &clap::ArgMatches) {
+    let op = matches.get_one::<String>("op").unwrap().as_str();
+    let seq1_path = matches.get_one::<std::path::PathBuf>("seq1").map(|p| p.as_path());
+    let seq2_path = matches.get_one::<std::path::PathBuf>("seq2").map(|p| p.as_path());
+    let sbwt1_path = matches.get_one::<std::path::PathBuf>("sbwt1").unwrap();
+    let sbwt2_path = matches.get_one::<std::path::PathBuf>("sbwt2").unwrap();
+    let result_path = matches.get_one::<std::path::PathBuf>("result").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+    let temp_dir = matches.get_one::<std::path::PathBuf>("temp-dir").unwrap();
+    let keep_unitigs = matches.get_flag("keep-unitigs");
+    let n_threads = *matches.get_one::<usize>("threads").unwrap();
+
+    std::fs::create_dir_all(temp_dir).expect("failed to create --temp-dir");
+
+    let op = match op {
+        "merge" => check::SetOperation::Union,
+        "intersect" => check::SetOperation::Intersection,
+        "difference" => check::SetOperation::Difference,
+        _ => panic!("Unkown set operation {op}"),
+    };
+
+    log::info!("Loading sbwt1 from {}", sbwt1_path.display());
+    let mut index1 = load_index(sbwt1_path, cpp_format);
+    log::info!("Loading sbwt2 from {}", sbwt2_path.display());
+    let mut index2 = load_index(sbwt2_path, cpp_format);
+    log::info!("Loading result index from {}", result_path.display());
+    let mut result_index = load_index(result_path, cpp_format);
+
+    let lcs1 = load_lcs_or_build_otherwise(
+        &default_lcs_path(sbwt1_path), &index1, n_threads, false // TODO: flag to optimize peak RAM
+    );
+
+    let lcs2 = load_lcs_or_build_otherwise(
+        &default_lcs_path(sbwt2_path), &index2, n_threads, false // TODO: flag to optimize peak RAM
+    );
+
+    let seq1_source = match seq1_path {
+        Some(p) => TempFilePath{path: p.to_path_buf(), delete_on_drop: false}, // Never delete existing seq file
+        None => { unitigs_to_tempfile(&mut index1, &lcs1, temp_dir, n_threads, !keep_unitigs) }
+    };
+
+    let seq2_source = match seq2_path {
+        Some(p) => TempFilePath{path: p.to_path_buf(), delete_on_drop: false}, // Never delete existing seq file
+        None => { unitigs_to_tempfile(&mut index2, &lcs2, temp_dir, n_threads, !keep_unitigs) }
+    };
+
+    check::run_check_set_operation(op, 
+        check::InputTriple{ source_seqs: seq1_source.path.to_path_buf(), index: &index1, lcs: &lcs1 }, 
+        check::InputTriple{ source_seqs: seq2_source.path.to_path_buf(), index: &index2, lcs: &lcs2 }, 
+        &mut result_index)
+}
+
+fn transform_index_command(matches: &clap::ArgMatches) {
+    let indexfile = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let outfile = matches.get_one::<std::path::PathBuf>("output").unwrap();
+    let target_type = matches.get_one::<String>("type").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+
+    // Open output file early to fail fast if path is invalid
+    let mut out = BufWriter::new(File::create(outfile).unwrap());
+
+    let index = load_index(indexfile, cpp_format);
+
+    // The target type strings are validated by clap, so no other combinations are possible.
+    let transformed = match (index, target_type.as_str()) {
+        (SbwtIndexVariant::SubsetMatrix(sbwt), "bit_matrix") => {
+            log::warn!("The index is already a bit matrix index");
+            SbwtIndexVariant::SubsetMatrix(sbwt)
+        },
+        (SbwtIndexVariant::SubsetCorrectionSets(sbwt), "correction_sets") => {
+            log::warn!("The index is already a correction sets index");
+            SbwtIndexVariant::SubsetCorrectionSets(sbwt)
+        },
+        (SbwtIndexVariant::SubsetCorrectionSets(sbwt), "bit_matrix") => {
+            log::info!("Transform correction sets -> bit matrix");
+            let (sbwt_subsetseq, n_kmers, k, _c_array, prefix_lookup_table) = sbwt.into_parts();
+            let p = prefix_lookup_table.prefix_length;
+            let rows: Vec<BitVec<u64, Lsb0>> = sbwt_subsetseq.into_bitvectors();
+            let ss_new = SubsetMatrix::new_from_bit_vectors(rows);
+            let index_new = SbwtIndex::<SubsetMatrix>::from_subset_seq(ss_new, n_kmers, k, p);
+            SbwtIndexVariant::SubsetMatrix(index_new)
+        },
+        (SbwtIndexVariant::SubsetMatrix(sbwt), "correction_sets") => {
+            log::info!("Transform bit matrix -> correction sets");
+            let (sbwt_subsetseq, n_kmers, k, _c_array, prefix_lookup_table) = sbwt.into_parts();
+            let p = prefix_lookup_table.prefix_length;
+            let rows: Vec<BitVec<u64, Lsb0>> = sbwt_subsetseq.into_bitvectors();
+            log::info!("Calling new from bit vectors");
+            let ss_new = SubsetCorrectionSets::new_from_bit_vectors(rows);
+            log::info!("Construction done for subset sequence of size {}, constructing SBWT index", ss_new.size_in_bytes());
+            let index_new = SbwtIndex::<SubsetCorrectionSets>::from_subset_seq(ss_new, n_kmers, k, p);
+            log::info!("SBWT construction done");
+            SbwtIndexVariant::SubsetCorrectionSets(index_new)
+        },
+        (_, t) => unreachable!("Unknown target index type {}", t),
+    };
+
+    log::info!("Serializing to {}", outfile.display());
+    let n_bytes = transformed.serialize(&mut out).unwrap();
+    log::info!("{} bytes written", n_bytes);
+}
+
+fn stats_command(matches: &clap::ArgMatches) {
+    let index_path = matches.get_one::<std::path::PathBuf>("index").unwrap();
+    let cpp_format = matches.get_flag("load-cpp-format");
+
+    let index = load_index(index_path, cpp_format);
+
+    println!("Number of k-mers: {}", index.n_kmers());
+    println!("Number of sbwt sets: {}", index.n_sets());
+}
+
+fn build_subcommand() -> clap::Command {
+    #[allow(unused_mut)]
+    let mut cmd = clap::Command::new("build")
+        .about("Build the SBWT and possibly the LCS array")
+        .arg_required_else_help(true)
+        .arg(clap::Arg::new("input")
+            .help("Input fasta or fastq sequence file")
+            .short('i')
+            .long("input")
+            .required(true)
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+        )
+        .arg(clap::Arg::new("input-list")
+            .help("A file containing a list of filenames of sequence lines, one per line")
+            .long("input-list")
+            .conflicts_with("input")
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+        )
+        .arg(clap::Arg::new("output-prefix")
+            .help("Prefix for the output filenames. Writes to file [prefix].sbwt, and also [prefix].lcs if --build-lcs is given.")
+            .short('o')
+            .long("output-prefix")
+            .required(true)
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+        )
+        .arg(clap::Arg::new("temp-dir")
+            .help("Directory for temporary files created during construction.")
+            .long("temp-dir")
+            .default_value(".")
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+        )
+        .arg(clap::Arg::new("in-memory")
+            .help("Sort k-mers in memory. Faster, but requires a lot of memory.")
+            .long("in-memory")
+            .action(clap::ArgAction::SetTrue)
+        )
+        .arg(clap::Arg::new("bounded-suffix-sort")
+            .help("Build by sorting the k-bounded contexts of the input instead of sorting k-mers. Holds the concatenation of the input sequences in memory. Not limited to k <= 256. Ignores --mem-gb, --dedup-batches and --temp-dir.")
+            .long("bounded-suffix-sort")
+            .conflicts_with("in-memory")
+            .action(clap::ArgAction::SetTrue)
+        )
+        .arg(clap::Arg::new("bucket-sort-prefix-length")
+            .help("Length of the prefix used to bucket the contexts before sorting them. Only used with --bounded-suffix-sort.")
+            .long("bucket-sort-prefix-length")
+            .default_value("4")
+            .value_parser(clap::value_parser!(usize)))
+        .arg(clap::Arg::new("stream-sa-from-disk")
+            .help("Whether to stream the suffix array from disk after it is constructed. Only used with --bounded-suffix-sort or --via-libsais if this binary is built with the 'libsais' feature enabled.")
+            .long("stream-sa-from-disk")
+            .action(clap::ArgAction::SetTrue)
+        )
+        .arg(clap::Arg::new("build-lcs")
+            .help("Also build the LCS array (costs about log(k) bits per SBWT node)")
+            .short('l')
+            .long("build-lcs")
+            .action(clap::ArgAction::SetTrue)
+        )
+        .arg(clap::Arg::new("k")
+            .help("k-mer length")
+            .short('k')
+            .required(true)
+            .value_parser(clap::value_parser!(usize))
+        )
+        .arg(clap::Arg::new("mem-gb")
+            .help("An approximate memory budget for various buffers, in gigabytes. The total memory usage may be higher. The larger the budget, the more effective the deduplication is with --dedup-batches.")
+            .short('m')
+            .long("mem-gb")
+            .required(false)
+            .value_parser(clap::value_parser!(usize))
+            .default_value("8")
+        )
+        .arg(clap::Arg::new("dedup-batches")
+            .help("Slows down the construction, but reduces temporary disk space usage and memory if the data has many duplicate k-mers.")
+            .long("dedup-batches")
+            .short('d')
+            .action(clap::ArgAction::SetTrue)
+        )
+        .arg(clap::Arg::new("add-revcomp")
+            .help("Add reverse reverse complements of all k-mers to the index.")
+            .long("add-revcomp")
+            .short('r')
+            .action(clap::ArgAction::SetTrue))
+        .arg(clap::Arg::new("add-all-dummy-paths")
+            .help("Include all dummy paths for every DNA run in the input, not only those strictly required by the SBWT structure.")
+            .long("add-all-dummy-paths")
+            .action(clap::ArgAction::SetTrue))
+        .arg(clap::Arg::new("prefix-precalc-length")
+            .help("Prefix precalc lookup table prefix length p. Larger p speeds up queries, but the table takes 4^(p+2) bytes of space.")
+            .long("prefix-precalc")
+            .short('p')
+            .default_value("8")
+            .value_parser(clap::value_parser!(usize)));
+
+    #[cfg(feature = "libsais")]
+    {
+        cmd = cmd.arg(clap::Arg::new("via-libsais")
+            .help("Build by constructing a suffix array and LCP array of the concatenation of the input with the libsais library, and deriving the SBWT from those. Holds the concatenation of the input sequences in memory, and is not limited to k <= 256.")
+            .long("via-libsais")
+            .conflicts_with_all(["in-memory", "bounded-suffix-sort"])
+            .action(clap::ArgAction::SetTrue)
+        );
+    }
+
+    cmd
+}
+
+fn main() {
+
+    let cli = clap::Command::new("sbwt")
+        .about("Command line tools using for the sbwt library.")
+        .arg_required_else_help(true)
+        .arg(clap::Arg::new("threads")
+            .help("Number of threads to use for parallelized operations")
+            .long("threads")
+            .short('t')
+            .default_value("4")
+            .global(true)
+            .value_parser(clap::value_parser!(usize))
+        )
+        .arg(clap::Arg::new("verbose")
+            .help("Print more information when running.")
+            .short('v')
+            .long("verbose")
+            .global(true)
+            .action(clap::ArgAction::SetTrue)
+        )
+        .subcommand(build_subcommand())
+        .subcommand(clap::Command::new("build-lcs")
+            .arg_required_else_help(true)
+            .about("Build the LCS array given an existing SBWT. Note that it's also possible build the SBWT and the LCS at the same time with the build-command.")
+            .arg(clap::Arg::new("index")
+                .help("SBWT index file")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("output")
+                .help("The output filename. By default if the input is at index.sbwt, the output will be at index.lcs.")
+                .long("output")
+                .short('o')
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("low-ram")
+                .help("Enable optimizations to reduce peak RAM at the expense of slower running time.")
+                .long("low-ram")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("benchmark")
+            .about("Benchmark queries on the index")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .help("SBWT index file")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("prefix-precalc-length")
+                .help("Disregard the precalc table that is stored in the index, and compute a new table with this prefix length." )
+                .long("prefix-precalc")
+                .short('p')
+                .value_parser(clap::value_parser!(usize))
+            )
+            .arg(clap::Arg::new("json-out")
+                .help("The results are written to this file in JSON format.")
+                .short('j')
+                .long("json-out")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+        )
+        .subcommand(clap::Command::new("lookup")
+            .about("Look up the colex ranks of all k-mers. Printed as space-separated ascii integers, one line per query sequence. If a k-mer does not exist in the index, the colex rank is -1.")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .help("SBWT index file")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("lcs-file")
+                .help("LCS file (default: if index is at index.sbwt, looks at index.lcs)")
+                .short('l')
+                .long("lcs-file")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("query")
+                .help("Query sequences in FASTA or FASTQ format, possibly gzipped")
+                .short('q')
+                .long("query")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output text file. If not given, prints to stdout.")
+                .short('o')
+                .long("output")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("membership-only")
+                .help("Instead of colex ranks, prints an ascii bitvector B for each query sequence, such that B[i] = 1 iff the i-th k-mer is present in the index.")
+                .short('b')
+                .long("membership-only")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("matching-statistics")
+            .about("For each position of the query, compute the longest match ending there, with length up to k, against the index.")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .help("SBWT index file")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("lcs-file")
+                .help("LCS file (default: if index is at index.sbwt, looks at index.lcs)")
+                .short('l')
+                .long("lcs-file")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("query")
+                .help("Query sequences in FASTA or FASTQ format, possibly gzipped")
+                .short('q')
+                .long("query")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output text file. Prints to stdout if not given. The output format is: for each query sequence there is a comma-separated list of pairs (l_i, a_i..b_i), where l_i is the length of the longest match up to k ending at position i, and a_i..b_i is the colexicographic range of the longest match.")
+                .short('o')
+                .long("output")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("merge")
+            .about("Merge two SBWT indexes")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("sbwt1")
+                .help("The first SBWT index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("sbwt2")
+                .help("The second SBWT index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output filename for the merged SBWT")
+                .short('o')
+                .long("output")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("low-ram")
+                .help("Enable optimizations to reduce peak RAM at the expense of slower running time.")
+                .long("low-ram")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("keep-redundant-dummies")
+                .help("Do not remove the dummy nodes that become redundant in the merge. The result has the same k-mers, but may have more dummy nodes.")
+                .long("keep-redundant-dummies")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("intersect")
+            .about("Intersect two SBWT indexes (keep only k-mers present in both)")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("sbwt1")
+                .help("The first SBWT index file")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("sbwt2")
+                .help("The second SBWT index file")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output filename for the intersection SBWT")
+                .short('o')
+                .long("output")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("low-ram")
+                .help("Enable optimizations to reduce peak RAM at the expense of slower running time.")
+                .long("low-ram")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("difference")
+            .about("Compute the set difference of two SBWT indexes (keep only k-mers in index1 but not in index2)")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("sbwt1")
+                .help("SBWT index to subtract from")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("sbwt2")
+                .help("SBWT index whose k-mers are removed")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output filename for the difference SBWT")
+                .short('o')
+                .long("output")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("low-ram")
+                .help("Enable optimizations to reduce peak RAM at the expense of slower running time.")
+                .long("low-ram")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("jaccard")
+            .arg_required_else_help(true)
+            .about("Compute the Jaccard index of the k-mer sets in two given sbwt index files.")
+            .arg(clap::Arg::new("sbwt1")
+                .help("The first SBWT index file")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("sbwt2")
+                .help("The second SBWT index file")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("low-ram")
+                .help("Enable optimizations to reduce peak RAM at the expense of slower running time.")
+                .long("low-ram")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("dump-kmers")
+            .about("Prints all k-mer strings in colex order, one per line.")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output text file. Prints to stdout if not given.")
+                .short('o')
+                .long("output")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("include-dummy-kmers")
+                .help("Include the dollar-padded dummy k-mers required for the SBWT")
+                .short('d')
+                .long("include-dummy-kmers")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("all-at-once")
+                .help("Runs a fast algorithm that that reconstructs everything into memory at once taking n*(k+2) bytes of space")
+                .short('a')
+                .long("all-at-once")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("dump-unitigs")
+            .about("Print all unitigs in arbitrary order in FASTA format")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output text file. Prints to stdout if not given.")
+                .short('o')
+                .long("output")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("transform-index")
+            .about("Transform an SBWT index into a different subset sequence representation")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .help("SBWT index file")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output")
+                .help("Output filename for the transformed SBWT")
+                .short('o')
+                .long("output")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("type")
+                .help("Target subset sequence representation of the transformed index")
+                .long("type")
+                .required(true)
+                .value_parser(["bit_matrix", "correction_sets"])
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("stats")
+            .about("Print statistics about the index")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("kmer-at-colex")
+            .about("Print the k-mer with a given colexicographic rank")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .help("SBWT index file")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("rank")
+                .help("Colexicographic rank of the k-mer to retrieve")
+                .short('r')
+                .long("rank")
+                .required(true)
+                .value_parser(clap::value_parser!(usize))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("check")
+            .about("Verify index correctness")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("index")
+                .short('i')
+                .long("index")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load the index from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("invariant")
+                .help("Verify the SBWT structural invariant (sum_c rank(c, n_sets) + 1 == n_sets). Exits with code 1 if the index is corrupt.")
+                .long("invariant")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("original-sequences")
+                .help("Searches all sequences in the given fasta/fastq file and check that the index contains exactly those k-mers. Remember to pass --add-revcomp if the index was built with that option.")
+                .long("original-sequences")
+                .short('s')
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("add-revcomp")
+                .help("Add reverse complements of the input sequences to the check.")
+                .long("add-revcomp")
+                .requires("original-sequences")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .group(clap::ArgGroup::new("at-least-one-of-these").required(true).multiple(true)
+                .args(["invariant", "original-sequences"]))
+
+        )
+        .subcommand(clap::Command::new("check-set-operation")
+            .about("Verify that `result` is exactly `sbwt1 <op> sbwt2`, computed from seq1/seq2 \
+                    (the original sequences sbwt1/sbwt2 were built from) rather than by \
+                    enumerating result's own k-mers, which may be far too many to dump as text. \
+                    If seq1/seq2 aren't given, the unitigs of sbwt1/sbwt2 are exported to \
+                    --temp-dir and used in their place.")
+            .arg_required_else_help(true)
+            .arg(clap::Arg::new("op")
+                .help("Which set operation was used to produce `result`.")
+                .long("op")
+                .required(true)
+                .value_parser(["merge", "intersect", "difference"])
+            )
+            .arg(clap::Arg::new("seq1")
+                .help("Fasta/fastq file that sbwt1 was built from. If not given, the unitigs \
+                       of sbwt1 are exported to --temp-dir and used instead.")
+                .long("seq1")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("seq2")
+                .help("Fasta/fastq file that sbwt2 was built from. Only used by --op merge; \
+                       if not given (and needed), the unitigs of sbwt2 are exported to \
+                       --temp-dir and used instead.")
+                .long("seq2")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("temp-dir")
+                .help("Directory to write generated unitig fasta files to, when --seq1/--seq2 \
+                       are not given. Created if it doesn't exist.")
+                .long("temp-dir")
+                .default_value(".")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("keep-unitigs")
+                .help("Do not delete generated unitig fasta files (see --temp-dir) when done.")
+                .long("keep-unitigs")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("sbwt1")
+                .help("SBWT index built from seq1.")
+                .long("sbwt1")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("sbwt2")
+                .help("SBWT index built from seq2.")
+                .long("sbwt2")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("result")
+                .help("SBWT index produced by running --op on sbwt1 and sbwt2.")
+                .long("result")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("load-cpp-format")
+                .help("Load sbwt1/sbwt2/result from the format used by the C++ API (only supports plain-matrix).")
+                .long("load-cpp-format")
+                .action(clap::ArgAction::SetTrue)
+            )
+        )
+        .subcommand(clap::Command::new("sort-kmers-to-disk")
+            .about("Sort and deduplicate the reverse k-mers of the input sequences into a file on disk. Prints the path to the resulting k-mers file (and, if --add-all-dummy-paths is given, the first-mers file) to stdout. The files are not deleted, and can be later given to build-from-kmers-on-disk.")
+            .arg_required_else_help(true)
+            .hide(true) // This is an advance command only for those who know what they are doing
+            .arg(clap::Arg::new("input")
+                .help("Input fasta or fastq sequence file")
+                .short('i')
+                .long("input")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("input-list")
+                .help("A file containing a list of filenames of sequence lines, one per line")
+                .long("input-list")
+                .conflicts_with("input")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("temp-dir")
+                .help("Directory for the resulting k-mers files, and other temporary files created during construction.")
+                .long("temp-dir")
+                .default_value(".")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("k")
+                .help("k-mer length")
+                .short('k')
+                .required(true)
+                .value_parser(clap::value_parser!(usize))
+            )
+            .arg(clap::Arg::new("mem-gb")
+                .help("An approximate memory budget for various buffers, in gigabytes. The total memory usage may be higher. The larger the budget, the more effective the deduplication is with --dedup-batches.")
+                .short('m')
+                .long("mem-gb")
+                .required(false)
+                .value_parser(clap::value_parser!(usize))
+                .default_value("8")
+            )
+            .arg(clap::Arg::new("dedup-batches")
+                .help("Slows down the construction, but reduces temporary disk space usage and memory if the data has many duplicate k-mers.")
+                .long("dedup-batches")
+                .short('d')
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("add-all-dummy-paths")
+                .help("Include all dummy paths for every DNA run in the input, not only those strictly required by the SBWT structure.")
+                .long("add-all-dummy-paths")
+                .action(clap::ArgAction::SetTrue))
+        )
+        .subcommand(clap::Command::new("build-from-kmers-on-disk")
+            .about("Build the SBWT and possibly the LCS array from a file of sorted, deduplicated reverse k-mers on disk, as produced by the on-disk construction algorithm.")
+            .arg_required_else_help(true)
+            .hide(true) // This is an advance command only for those who know what they are doing
+            .arg(clap::Arg::new("kmers-file")
+                .help("A file containing the sorted, deduplicated, bit-packed reverse k-mers.")
+                .long("kmers-file")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("first-mers-file")
+                .help("An optional file containing the bit-packed reversed first k-mers of each input sequence, used to determine which additional dummy paths are required.")
+                .long("first-mers-file")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("output-prefix")
+                .help("Prefix for the output filenames. Writes to file [prefix].sbwt, and also [prefix].lcs if --build-lcs is given.")
+                .short('o')
+                .long("output-prefix")
+                .required(true)
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("temp-dir")
+                .help("Directory for temporary files created during construction.")
+                .long("temp-dir")
+                .default_value(".")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+            )
+            .arg(clap::Arg::new("build-lcs")
+                .help("Also build the LCS array (costs about log(k) bits per SBWT node)")
+                .short('l')
+                .long("build-lcs")
+                .action(clap::ArgAction::SetTrue)
+            )
+            .arg(clap::Arg::new("k")
+                .help("k-mer length")
+                .short('k')
+                .required(true)
+                .value_parser(clap::value_parser!(usize))
+            )
+        )
+        ;
+
+    let matches = cli.get_matches();
+
+    // Initialize logging 
+    let mut builder = env_logger::builder();
+    if matches.get_flag("verbose") {
+        builder.filter_level(log::LevelFilter::Debug);
+    } else {
+        builder.filter_level(log::LevelFilter::Info);
+    };
+
+    // Renaming DEBUG level to INFO. We're using the DEBUG level as
+    // a more verbose INFO level. Unfortunately the log crate interface does not support
+    // multiple kinds of INFO-level messages, so we have this workaround.
+    builder.format(|buf, record| {
+        
+        let style = match record.level() {
+            log::Level::Debug => buf.default_level_style(log::Level::Info), // Use INFO level styling for DEBUG messages
+            _ => buf.default_level_style(record.level()),
+        };
+
+        let level_string = match record.level() {
+            log::Level::Debug => style.value("INFO"),
+            _ => style.value(record.level().as_str()),
+        };
+
+        let module = match record.module_path() {
+            None => "unknown",
+            Some(x) => x,
+        };
+
+        let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+
+        writeln!(buf, "[{}] [{}] [{}]: {}", level_string, time, module, record.args())
+    });
+    builder.init();
+
+    log::info!("sbwt-rs-cli version {}, api version {}", env!("CARGO_PKG_VERSION"), sbwt::CARGO_API_VERSION);
+
+    match matches.subcommand(){
+        Some(("build", sub_matches)) => build_command(sub_matches),
+        Some(("build-list-kmers-on-disk", sub_matches)) => build_list_kmers_on_disk_command(sub_matches),
+        Some(("build-from-kmers-on-disk", sub_matches)) => build_from_kmers_on_disk_command(sub_matches),
+        Some(("build-lcs", sub_matches)) => build_lcs_command(sub_matches),
+        Some(("lookup", sub_matches)) => lookup_query_command(sub_matches),
+        Some(("matching-statistics", sub_matches)) => matching_statistics_command(sub_matches),
+        Some(("jaccard", sub_matches)) => jaccard_command(sub_matches),
+        Some(("merge", sub_matches)) => merge_command(sub_matches),
+        Some(("intersect", sub_matches)) => intersect_command(sub_matches),
+        Some(("difference", sub_matches)) => difference_command(sub_matches),
+        Some(("benchmark", sub_matches)) => benchmark_command(sub_matches),
+        Some(("dump-kmers", sub_matches)) => dump_kmers_command(sub_matches),
+        Some(("dump-unitigs", sub_matches)) => dump_unitigs_command(sub_matches),
+        Some(("stats", sub_matches)) => stats_command(sub_matches),
+        Some(("transform-index", sub_matches)) => transform_index_command(sub_matches),
+        Some(("kmer-at-colex", sub_matches)) => kmer_at_rank_command(sub_matches),
+        Some(("check", sub_matches)) => check_command(sub_matches),
+        Some(("check-set-operation", sub_matches)) => check_set_operation_command(sub_matches),
+        _ => unreachable!(),
+    }
+    
+}

@@ -1,0 +1,75 @@
+use bitvec::vec::BitVec;
+
+// Ensure that usize is an u64 in LSB byte order (assumed in into_bitvec)
+const _: () = assert!(1_usize == 1_usize.to_le());
+const _: () = assert!(usize::BITS == u64::BITS);
+
+pub struct AtomicBitmap {
+    pub data: Vec<std::sync::atomic::AtomicU64>,
+    pub len: usize, // Number of bits stored. The last word may be only partially used.
+} 
+
+impl AtomicBitmap {
+    pub fn new(len: usize) -> Self {
+        let n_words = len.div_ceil(64);
+        let data = (0..n_words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        Self {data, len}
+    }
+
+    pub fn set(&self, index: usize, value: bool) {
+        assert!(index < self.len);
+        let word_idx = index / 64;
+        let bit_idx = index % 64;
+        let mask = 1_u64 << bit_idx;
+        if value {
+            self.data[word_idx].fetch_or(mask, std::sync::atomic::Ordering::Release);
+        } else {
+            self.data[word_idx].fetch_and(!mask, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Sets the bit at `index` and returns whether it was already set.
+    pub fn test_and_set(&self, index: usize) -> bool {
+        assert!(index < self.len);
+        let mask = 1_u64 << (index % 64);
+        self.data[index / 64].fetch_or(mask, std::sync::atomic::Ordering::AcqRel) & mask != 0
+    }
+
+    pub fn get(&self, index: usize) -> bool {
+        assert!(index < self.len);
+        let word_idx = index / 64;
+        let bit_idx = index % 64;
+        let mask = 1_u64 << bit_idx;
+        (self.data[word_idx].load(std::sync::atomic::Ordering::Acquire) & mask) != 0
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn into_bitvec(self) -> BitVec<usize, bitvec::order::Lsb0> {
+        // This assumes that usize is an u64 in Lsb0 byte order. There are
+        // asserts at the top of the file that attempt to ensure this.
+
+        // Make sizes not atomic
+        let non_atomic: Vec<usize> = self.data.into_iter().map(
+            |x| x.load(std::sync::atomic::Ordering::Acquire) as usize
+        ).collect();
+        let mut bv = BitVec::from_vec(non_atomic);
+        bv.truncate(self.len); // Truncate the leftover bits in the last word
+        bv
+    }
+
+    pub fn into_bitvec_u64(self) -> BitVec<u64, bitvec::order::Lsb0> {
+        // This assumes that usize is an u64 in Lsb0 byte order. There are
+        // asserts at the top of the file that attempt to ensure this.
+
+        let non_atomic: Vec<u64> = self.data.into_iter().map(
+            |x| x.load(std::sync::atomic::Ordering::Acquire)
+        ).collect();
+        let mut bv = BitVec::from_vec(non_atomic);
+        bv.truncate(self.len); // Truncate the leftover bits in the last word
+        bv
+    }
+}
