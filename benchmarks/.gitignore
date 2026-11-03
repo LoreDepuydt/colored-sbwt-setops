@@ -1,0 +1,18 @@
+# Written by the scripts
+experiments/bin/
+experiments/runs/
+experiments/ledger.tsv
+experiments/ledger.tsv.lock
+experiments/*checks.tsv
+experiments/*_stats.tsv
+experiments/parts_build.tsv
+experiments/.lock
+atb/gfastat/target/
+atb/mtb2025/lists/
+atb/mtb2025/archives/
+atb/mtb2025/runs/
+atb/mtb2025/res/
+atb/mtb2025/ledger.tsv
+experiments/oldfilter_compare.tsv
+experiments/repair_stats.tsv
+experiments/phase_times.tsv

@@ -1,0 +1,10 @@
+s_pneumoniae/SAMEA2814221.fa
+s_pneumoniae/SAMEA4978062.fa
+s_pneumoniae/SAMEA112486748.fa
+s_pneumoniae/SAMEA5187432.fa
+s_pneumoniae/SAMEA115606224.fa
+s_pneumoniae/SAMEA114408093.fa
+s_pneumoniae/SAMEA4732124.fa
+s_pneumoniae/SAMN20332535.fa
+s_pneumoniae/SAMN05223178.fa
+s_pneumoniae/SAMN14150944.fa
