@@ -1,0 +1,145 @@
+use bitvec::order::Lsb0;
+use byteorder::{LittleEndian, ReadBytesExt};
+use rand::AsByteSliceMut;
+use simple_sds_sbwt::serialize::Serialize;
+use std::io::Read;
+
+// Loads an sdsl::bit_vector
+pub fn load_sdsl_bit_vector(input: &mut impl std::io::Read) -> std::io::Result<bitvec::vec::BitVec<u64, Lsb0>> {
+    // sdsl format is: [number of bits][data]
+    let n_bits = input.read_u64::<LittleEndian>()?;
+
+    // The length of the serialized data is padded to a multiple of 64 bits.
+    let n_bits_plus_pad = n_bits.div_ceil(64) * 64;
+    let n_bytes = n_bits_plus_pad / 8;
+    let n_words = n_bytes / 8;
+
+    let mut words: Vec<u64> = vec![0; n_words as usize];
+    input.read_exact(words.as_byte_slice_mut()).unwrap();
+    let mut vec = bitvec::vec::BitVec::<u64, Lsb0>::from_vec(words);
+    assert!(vec.len() >= n_bits as usize);
+    vec.truncate(n_bits as usize); // Trailing zeros are not real elements
+    Ok(vec)
+}
+
+/// Loads an sdsl::int_vector<0> (width is determined at runtime)
+pub fn load_runtime_width_sdsl_int_vector(input: &mut impl std::io::Read) -> std::io::Result<simple_sds_sbwt::int_vector::IntVector> {
+    // The sdsl::int_vector<0> is serialized in the following format:
+    // [number of bits as u64][width as u8][data]
+    // (If the width is assumed to be known at compile-time, that is, if the template parameter is greater than zero, 
+    // then the width is not serialized, but we are not concerned with that case here).
+
+    // The simple_sds format is:
+    // [number of elements as u64] [width as u64] [RawVector]
+    // where RawVector is a bit vector in the format explained in load_sdsl_bit_vector.
+
+    // So now, we need to read the header in sdsl format (9 bytes total), and replace it with
+    // the header for simple_sds, including the header for RawVector.
+
+    let n_bits = input.read_u64::<LittleEndian>()?; // Not including the header
+    let width = input.read_u8()? as u64;
+
+    assert!(n_bits % width == 0); 
+    let n_elements = n_bits / width;
+
+    // The length of the serialized data is padded to a multiple of 64 bits.
+    let n_bits_plus_pad = n_bits.div_ceil(64) * 64;
+    let n_bytes = n_bits_plus_pad / 8;
+    let n_words = n_bytes / 8;
+
+    let mut new_header = [n_elements, width, n_bits, n_words]; // Assumes little endian byte order
+    let mut modified_input = new_header.as_byte_slice_mut().chain(input);
+
+    simple_sds_sbwt::int_vector::IntVector::load(&mut modified_input)
+}
+
+/// Loads an sdsl::int_vector<w> (width w is known at compile time) 
+pub fn load_known_width_sdsl_int_vector(input: &mut impl std::io::Read, width: u8) -> std::io::Result<simple_sds_sbwt::int_vector::IntVector> {
+    // We insert the width byte to the header so that we can use load_runtime_width_sdsl_int_vector to read the vector.
+    let n_bits = input.read_u64::<LittleEndian>()?; // Not including the header
+    let mut new_header = [0u8; 9];
+    new_header[0..8].copy_from_slice(&n_bits.to_le_bytes());
+    new_header[8] = width;
+
+    let mut modified_input = new_header.as_byte_slice_mut().chain(input);
+
+    load_runtime_width_sdsl_int_vector(&mut modified_input)
+
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use hex_literal::hex;
+    use simple_sds_sbwt::ops::{Access, Vector};
+
+    #[test]
+    fn test_load_sdsl_bit_vector(){
+        // This is an sdsl vector of length 129 that is all zeroes except v[8] = 1 and v[9] = 1
+        let data = hex!("81 00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00");
+
+        let v = load_sdsl_bit_vector(&mut std::io::Cursor::new(&data)).unwrap();
+        assert!(v.len() == 129);
+
+        for i in 0..129 {
+            print!("{}", v[i]);
+            if v[i] {
+                assert!(i == 8 || i == 9);
+            } else {
+                assert!(i != 8 && i != 9);
+            }
+        }
+        println!();
+    }
+
+    #[test]
+    fn test_load_empty_sdsl_bit_vector(){
+
+        let data = hex!("00 00 00 00 00 00 00 00");
+
+        let v = load_sdsl_bit_vector(&mut std::io::Cursor::new(&data)).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn test_load_runtime_sdsl_int_vector(){
+        // This is an sdsl bit vector width 20 elements of width 5, such that v[3] = 7 and all other elements are zero
+        let data = hex!("64 00 00 00 00 00 00 00 05 00 80 03 00 00 00 00 00 00 00 00 00 00 00 00 00");
+
+        let v = load_runtime_width_sdsl_int_vector(&mut std::io::Cursor::new(&data)).unwrap();
+        assert!(v.len() == 20);
+        assert!(v.width() == 5);
+
+        for i in 0..v.len() {
+            print!("{} ", v.get(i));
+            if i == 3 {
+                assert!(v.get(i) == 7);
+            } else {
+                assert!(v.get(i) == 0);
+            }
+        }
+        println!();
+    }
+
+    #[test]
+    fn test_load_compile_time_sdsl_int_vector(){
+        // This is an sdsl bit vector width 20 elements of width 5, such that v[3] = 7 and all other elements are zero
+        let data = hex!("64 00 00 00 00 00 00 00 00 80 03 00 00 00 00 00 00 00 00 00 00 00 00 00");
+        let width = 5;
+
+        let v = load_known_width_sdsl_int_vector(&mut std::io::Cursor::new(&data), width).unwrap();
+        assert!(v.len() == 20);
+        assert!(v.width() == 5);
+
+        for i in 0..v.len() {
+            print!("{} ", v.get(i));
+            if i == 3 {
+                assert!(v.get(i) == 7);
+            } else {
+                assert!(v.get(i) == 0);
+            }
+        }
+        println!();
+    }
+}

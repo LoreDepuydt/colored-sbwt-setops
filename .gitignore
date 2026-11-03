@@ -1,0 +1,9 @@
+target
+temp
+api/index.*
+.gitignore
+.vscode/launch.json
+benchmarks/merge_cleanup/themisto2.code-workspace
+*.log
+perf.data
+.vscode/tasks.json

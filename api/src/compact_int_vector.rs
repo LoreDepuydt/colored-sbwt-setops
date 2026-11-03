@@ -1,0 +1,223 @@
+use std::cmp::min;
+
+use num::Integer;
+
+fn get_int<const BIT_WIDTH: usize>(data: &[u64], i: usize) -> usize {
+    let bit_idx = i * BIT_WIDTH; 
+    let word_idx = bit_idx / 64;
+    let word_offset = bit_idx % 64; // Index of the least sigfinicant bit of the bitslice that is updated
+    if word_offset + BIT_WIDTH <= 64 { // Int fits in this word
+        let mask = (1_u64 << BIT_WIDTH) - 1;
+        let bits = (data[word_idx] >> word_offset) & mask;
+        bits as usize
+    } else { // Combine bits from two words
+
+        let n_bits1 = 64 - word_offset; // All of the highest-order bits in the first word
+        let n_bits2 = BIT_WIDTH - n_bits1; // Rest of the bits from the start of the second word
+        debug_assert!(n_bits1 + n_bits2 == BIT_WIDTH);
+
+        let x1 = data[word_idx] >> word_offset; // Tail of the first word
+        let x2 = data[word_idx + 1] & ((1_u64 << n_bits2) - 1); // Head of the second word
+
+        (x1 | (x2 << n_bits1)) as usize // Piece together
+    }
+}
+
+
+fn set_int<const BIT_WIDTH: usize>(data: &mut [u64], i: usize, x: usize) {
+    debug_assert!((x as u64) < (1_u64 << BIT_WIDTH));
+    let bit_idx = i * BIT_WIDTH; 
+    let word_idx = bit_idx / 64;
+    let word_offset = bit_idx % 64; // Index of the least sigfinicant bit of the bitslice that is updated
+    if word_offset + BIT_WIDTH <= 64 { // Int fits in this word
+        let mask = (1_u64 << BIT_WIDTH) - 1; // Hopefully computed at compile time
+        data[word_idx] &= !(mask << word_offset); // Clear the bits
+        data[word_idx] |= (x as u64) << word_offset ; // Set new bits
+    } else { // Combine bits from two words
+        let n_bits1 = 64 - word_offset; // All of the highest-order bits in the first word
+        let n_bits2 = BIT_WIDTH - n_bits1; // Rest of the bits from the start of the second word
+
+        let mask1 = (1_u64 << n_bits1) - 1;
+        let clearmask1 = !(mask1 << word_offset);
+        let setmask1 = (x as u64 & mask1) << word_offset;
+
+        data[word_idx] &= clearmask1; // Clear the bits
+        data[word_idx] |= setmask1; // Set the bits
+
+        let mask2 = (1_u64 << n_bits2) - 1;
+        let clearmask2 = !mask2;
+        let setmask2 = x as u64 >> n_bits1;
+
+        data[word_idx + 1] &= clearmask2; // Clear the bits
+        data[word_idx + 1] |= setmask2; // Set the bits
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactIntVector<const BIT_WIDTH: usize> {
+    data: Vec<u64>,
+    n_elements: usize,
+}
+
+#[derive(Debug)]
+pub struct CompactIntVectorMutSlice<'a, const BIT_WIDTH: usize> {
+    data: &'a mut [u64],
+    n_elements: usize,
+}
+
+impl<const BIT_WIDTH: usize> CompactIntVectorMutSlice<'_, BIT_WIDTH> {
+
+    pub fn get(&self, i: usize) -> usize {
+        debug_assert!(i < self.len());
+        get_int::<BIT_WIDTH>(self.data, i)
+    }
+
+    pub fn set(&mut self, i: usize, x: usize) {
+        debug_assert!(i < self.len());
+        debug_assert!(x <= self.max_allowed_value());
+        set_int::<BIT_WIDTH>(self.data, i, x)
+    }
+
+    pub fn len(&self) -> usize {
+        self.n_elements
+    }
+
+    // Hopefully this compiles to just a constant
+    pub fn max_allowed_value(&self) -> usize {
+        ((1_u64 << BIT_WIDTH) - 1) as usize
+    }
+}
+
+
+impl<const BIT_WIDTH: usize> CompactIntVector<BIT_WIDTH> {
+    pub fn get(&self, i: usize) -> usize {
+        debug_assert!(i < self.len());
+        get_int::<BIT_WIDTH>(&self.data, i)
+    }
+
+    pub fn set(&mut self, i: usize, x: usize) {
+        debug_assert!(i < self.len());
+        debug_assert!(x <= self.max_allowed_value());
+        set_int::<BIT_WIDTH>(&mut self.data, i, x)
+    }
+
+    /// IMPORTANT: this requires that the range lengths are multiples of lcm(BIT_WIDTH, 64) / BIT_WIDTH,
+    /// except possibly the last nonzero one, and that the range lengths sum to self.len(). You can use
+    /// [CompactIntVector::split_to_approx_even_mut_ranges] if you just want roughly even pieces.
+    #[allow(clippy::len_zero)]
+    pub fn split_to_mut_ranges<'a>(&'a mut self, range_lengths: &[usize]) -> Vec<CompactIntVectorMutSlice<'a, BIT_WIDTH>> {
+        assert!(!range_lengths.is_empty());
+
+        // Validate range lengths.
+        // The last nonempty piece may be of any length.
+        let elements_unit = 64.lcm(&BIT_WIDTH) / BIT_WIDTH; // This many elements fit exactly in one word
+        let mut nonzero_seen = false;
+        for &len in range_lengths.iter().rev() {
+            assert!(!nonzero_seen || len % elements_unit == 0);
+            nonzero_seen |= len > 0;
+        }
+        assert!(range_lengths.iter().sum::<usize>() == self.n_elements);
+
+        // Input ranges are valid
+
+        let n_ranges = range_lengths.len();
+        let mut tail = self.data.as_mut_slice();
+        let mut pieces = Vec::<CompactIntVectorMutSlice<BIT_WIDTH>>::with_capacity(n_ranges);
+        for &num_elements in range_lengths {
+            let num_words = (num_elements * BIT_WIDTH).div_ceil(64); // There might be a remainder on the last nonzero piece
+            let (head, new_tail) = tail.split_at_mut(num_words);
+            pieces.push(CompactIntVectorMutSlice{data: head, n_elements: num_elements});
+            tail = new_tail;
+        }
+
+        pieces
+    }
+
+    #[allow(clippy::len_zero)]
+    pub fn split_to_approx_even_mut_ranges<'a>(&'a mut self, n_ranges: usize) -> Vec<CompactIntVectorMutSlice<'a, BIT_WIDTH>> {
+
+        let n_words = self.data.len();
+
+        // Smallest number of words that fits an array of elements exactly
+        let word_unit = 64_usize.lcm(&BIT_WIDTH) / 64;
+
+        let n_word_units = n_words.div_ceil(word_unit);
+        let n_word_units_in_piece = n_word_units.div_ceil(n_ranges);
+        let n_words_in_piece = n_word_units_in_piece * word_unit;
+
+        assert!(n_words_in_piece*64 % BIT_WIDTH == 0);
+        let n_elements_in_piece = n_words_in_piece*64 / BIT_WIDTH;
+
+        let mut piece_lengths = Vec::<usize>::with_capacity(n_ranges); // In elements
+        let mut rem_elements = self.len();
+        for _ in 0..n_ranges {
+            let len = min(n_elements_in_piece, rem_elements);
+            piece_lengths.push(len);
+            rem_elements -= len;
+        }
+
+        self.split_to_mut_ranges(&piece_lengths)
+    }
+
+    pub fn len(&self) -> usize {
+        self.n_elements
+    }
+
+    // Hopefully this compiles to just a constant
+    pub fn max_allowed_value(&self) -> usize {
+        ((1_u64 << BIT_WIDTH) - 1) as usize
+    }
+
+    // Initializes all elements to zeros
+    pub fn new(len: usize) -> CompactIntVector<BIT_WIDTH> {
+        assert!(BIT_WIDTH > 0);
+        assert!(BIT_WIDTH < 64); // Not sure if 64 would work because 1 << 64 overflows
+        CompactIntVector{data: vec![0_u64; (len * BIT_WIDTH).div_ceil(64)], n_elements: len}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompactIntVector;
+
+    #[test]
+    fn set_and_get() {
+        let len = 300;
+
+        // Bit width 5 does not divide 64 so we get elements
+        // spanning two words.
+        let mut v = CompactIntVector::<5>::new(len);
+        for i in 0..v.len() {
+            v.set(i, i % v.max_allowed_value()); 
+        }
+        for i in 0..v.len() {
+            let x = i % v.max_allowed_value();
+            assert_eq!(v.get(i), x) ;
+        }
+    }
+
+    #[test]
+    fn split_to_mut_ranges() {
+        let len = 300;
+
+        // Bit width 5 does not divide 64 so we get elements
+        // spanning two words.
+        let mut v = CompactIntVector::<5>::new(len);
+        let maxval = v.max_allowed_value();
+
+        let pieces = v.split_to_approx_even_mut_ranges(100);
+        let mut x = 0_usize;
+        for mut r in pieces {
+            for i in 0..r.len() {
+                r.set(i, x);
+                x = (x + 1) % maxval;
+            }
+        }
+
+        for i in 0..v.len() {
+            dbg!(v.get(i));
+            assert_eq!(v.get(i), i % maxval);
+        }
+
+    }
+}
