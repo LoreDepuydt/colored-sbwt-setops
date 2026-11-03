@@ -80,4 +80,5 @@ The results can be queried as any index of `themisto2` (`threshold-pseudoalign`,
 
 ## License
 
-TODO
+MIT, see [LICENSE](LICENSE). `sbwt-rs-cli/` keeps its own MIT license, in
+[sbwt-rs-cli/LICENSE.txt](sbwt-rs-cli/LICENSE.txt).
