@@ -12,7 +12,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 W=${W:?set W, the work folder of mtb_case.bash}
 B=${B:-$HERE/../../colors/target/release/themisto2}
 CAPPED=$HERE/capped_run.bash
-A=${A:?set A, the ATB species index}
+A=${A:?set A, the ATB species index (contact the authors for a link)}
 MTB=per_species_unitigs/mycobacterium_tuberculosis-unitigs-k31.fna
 export WAIT_S=${WAIT_S:-172800} MIN_FREE_GB=${MIN_FREE_GB:-24}
 X_CAP=${X_CAP:-410}

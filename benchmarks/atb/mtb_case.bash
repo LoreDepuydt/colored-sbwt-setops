@@ -26,7 +26,8 @@
 # lock (taking turns with ../experiments) and for the memory it needs. A step is skipped
 # when its output exists: start again after a failure (delete the broken output first).
 #
-# Inputs (settings): W the work folder; A the ATB species index; REF the index of H37Rv (NC_000962) and
+# Inputs (settings): W the work folder; A the ATB species index (contact the authors for a link);
+# REF the index of H37Rv (NC_000962) and
 # M. bovis AF2122/97 (NC_002945), one color; HUMAN the index of CHM13 v2.0, one color, and CHM13 its
 # FASTA (for the human reads); ATB_META the ATB metadata (see mtb_case.py); B the themisto2 binary
 # (default: colors/ of this repository); GS gfastat (default: gfastat/ here, cargo build --release);
@@ -42,7 +43,7 @@ B=${B:-$HERE/../../colors/target/release/themisto2}
 GS=${GS:-$HERE/gfastat/target/release/gfastat}
 CAPPED=$HERE/capped_run.bash
 PY="python3 -I $HERE/mtb_case.py"
-A=${A:?set A, the ATB species index}
+A=${A:?set A, the ATB species index (contact the authors for a link)}
 OLD_M=${OLD_M:-}
 REF=${REF:?set REF, the index of the two reference genomes}
 HUMAN=${HUMAN:?set HUMAN, the index of CHM13}
