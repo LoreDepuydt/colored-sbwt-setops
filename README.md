@@ -103,23 +103,51 @@ Good to know:
   of a color is its path as written in the list, for example `example/C1.fna`.
 - **Colors with the same name.** `merge` and `intersect` keep the colors of the two inputs apart, so a
   name can occur twice in the result. To make them one color, pass `--merge-shared-colors`, which is
-  what you want when the inputs come from the same collection.
+  what you want when the inputs come from the same collection. Duplicate names can not be merged later.
 - **The same k.** All inputs of an operation must have the same k.
-- **Memory.** `--low-ram-mode` uses slower algorithms that need less memory; the result is the same.
+- **Output files.** Use a new name for `-o`: `build`, `merge`, `intersect` and `difference` clear the
+  output when they start, so an output that is also an input is lost.
+- **Memory and disk.** The set operations and queries load the whole index into memory.
+  `--low-ram-mode` uses slower algorithms that need less memory; the result is the same. `export` writes
+  text, which can be far larger than the index.
+- **Export and import.** `import` numbers the colors: the color names are not kept.
 - **The LCS array.** Queries use it to move from one k-mer to the next in about one step per base. An
   index without one (`--no-lcs`) can still be queried, but each k-mer is searched from scratch: about
   1.5 to 1.75 times slower in a small test, and probably more on large indexes.
 
+## Query modes
+
+For each query sequence, both modes write one JSON line with the name of the sequence and its colors.
+
+- `intersection-pseudoalign` reports the colors of *every* k-mer of the query that is in the index.
+- `threshold-pseudoalign` reports the colors of at least a fraction of the k-mers of the query, given by
+  `--threshold`. This is more robust to sequencing errors, small variants and incomplete references, but
+  less sensitive to small strain-level variation.
+
 ## Large indexes
 
-For more than a few gigabytes of genomes, deduplicate the k-mers with
-[GGCAT](https://github.com/algbio/ggcat) and build the SBWT first. The final index is the same, and the
-construction can be orders of magnitude faster. The steps are in
-[Constructing large indices](colors/README.md#constructing-large-indices). The `sbwt` tool of that
-pipeline is in this repository: run `cargo build --release` in `sbwt-rs-cli/`. Keep the LCS array (`-l`
-in both `sbwt build` and `themisto2 build`), to make queries faster.
+For more than a few gigabytes of repetitive genomes, deduplicate the k-mers first. The final index is the
+same, and the construction can be orders of magnitude faster. This needs
+[GGCAT](https://github.com/algbio/ggcat) (BCALM2 and Cuttlefish 3 also work) and the `sbwt` tool of this
+repository: run `cargo build --release` in `sbwt-rs-cli/`.
 
-For the query modes and their options, see [colors/README.md](colors/README.md).
+```bash
+# Unitigs of all genomes together, without colors. GGCAT needs a list with only the file names.
+cut -f1 colors.tsv > genomes.txt
+ggcat build -l genomes.txt -o unitigs.fna -s 1 -k 31 -t temp -j 32 -m 64 -p
+# The SBWT and LCS array of the unitigs: unitigs.sbwt and unitigs.lcs
+sbwt build -i unitigs.fna -o unitigs -k 31 -r -l -t 32 -m 64 -v --temp-dir temp
+# The colors, from the original genomes
+themisto2 build --file-colors colors.tsv -s unitigs.sbwt -l unitigs.lcs -o index.thm2 -k 31 -t 32
+```
+
+These commands use 32 threads and 64 GiB of memory (`-m`). In `ggcat`, `-s 1` is very important: without
+it, GGCAT discards the k-mers that occur once. The temporary folder of `sbwt` should be on a fast disk with
+up to 8 bytes per distinct k-mer. Keep the LCS array (`-l` in `sbwt build` and `themisto2 build`), to make
+queries faster.
+
+The SBWT must be built with `-r`, from exactly the genomes of the color list: the k-mers of a genome that
+is only in the SBWT silently get no colors.
 
 ## Repository layout
 
@@ -139,6 +167,11 @@ If you use this software, please cite:
 > Colored k-mer Indexes.* 2026.
 
 A preprint will follow.
+
+The construction algorithm of Themisto 2 is described in:
+
+> Jarno N. Alanko and Simon J. Puglisi. [*Construction of Distinct k-mer Color Sets via Set
+> Fingerprinting.*](https://doi.org/10.4230/LIPIcs.WABI.2026.6) WABI 2026, LIPIcs 390, 6:1–6:17.
 
 ## Reproducing the paper
 

@@ -11,6 +11,9 @@ All experiments ran on a shared server with two Xeon Gold 6430 processors (64 co
 hyper-threading), 503 GiB of RAM and a local NVMe SSD, with 32 threads. Timings on other hardware will
 differ; the results of the operations (the indexes) do not.
 
+The scripts assume such a server: `run.bash` needs 200 GiB of free disk and waits for the memory of the
+run plus 64 GiB to be available, and `download_pneumo.bash` needs 500 GiB of free disk on top of the download.
+
 ## Requirements
 
 - Linux with cgroups v2 and a systemd user instance: every run is capped with
