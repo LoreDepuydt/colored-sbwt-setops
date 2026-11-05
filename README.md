@@ -117,7 +117,7 @@ For more than a few gigabytes of genomes, deduplicate the k-mers with
 construction can be orders of magnitude faster. The steps are in
 [Constructing large indices](colors/README.md#constructing-large-indices). The `sbwt` tool of that
 pipeline is in this repository: run `cargo build --release` in `sbwt-rs-cli/`. Keep the LCS array (`-l`
-in both `sbwt build` and `themisto2 build`), which makes queries faster.
+in both `sbwt build` and `themisto2 build`), to make queries faster.
 
 For the query modes and their options, see [colors/README.md](colors/README.md).
 
@@ -129,7 +129,7 @@ For the query modes and their options, see [colors/README.md](colors/README.md).
 | `sbwt-rs-cli/` | the SBWT library and its command-line tool, with the operations on SBWTs (from [sbwt-rs-cli](https://github.com/jnalanko/sbwt-rs-cli)) |
 | `benchmarks/` | the scripts of the experiments of the paper |
 
-Both tools will be merged into their upstream repositories.
+Both tools will be merged into their upstream repositories in time.
 
 ## Citation
 
