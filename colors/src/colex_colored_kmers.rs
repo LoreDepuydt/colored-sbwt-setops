@@ -720,8 +720,6 @@ impl<CSS: ColorSetStorage> CompactColexKmers<CSS> {
             return;
         }
 
-        let si = sbwt::StreamingIndex::new(&self.sbwt, &self.lcs);
-
         #[derive(Eq, PartialEq, Debug)]
         enum ColorId { // Contains colex rank in the value, if exists
             Sampled(usize),
@@ -731,19 +729,27 @@ impl<CSS: ColorSetStorage> CompactColexKmers<CSS> {
 
         let mut colex_positions = Vec::<ColorId>::with_capacity(seq.len()-k+1);
 
+        let color_id = |colex: Option<usize>| match colex {
+            Some(colex) if self.map.sampling.get(colex) => ColorId::Sampled(colex),
+            Some(colex) => ColorId::SameAsNext(colex),
+            None => ColorId::AbsentKmer,
+        };
+
         // Pass 1: Compute colex ranks and whether the k-mers are sampled
-        for (len, range) in si.matching_statistics_iter(seq).skip(k-1) {
-            if len == k {
-                assert!(range.len() == 1);
-                let colex = range.start;
-                if self.map.sampling.get(colex) {
-                    colex_positions.push(ColorId::Sampled(colex));
-                } else {
-                    colex_positions.push(ColorId::SameAsNext(colex));
+        match crate::kmer_locator::lcs_if_present(&self.lcs) {
+            Some(lcs) => {
+                for (len, range) in sbwt::StreamingIndex::new(&self.sbwt, lcs).matching_statistics_iter(seq).skip(k-1) {
+                    assert!(len < k || range.len() == 1);
+                    colex_positions.push(color_id((len == k).then_some(range.start)));
                 }
-            } else {
-                colex_positions.push(ColorId::AbsentKmer);
-            }
+            },
+            None => { // An index built without an LCS array: search each k-mer from scratch
+                for kmer in seq.windows(k) {
+                    let colex = kmer.iter().all(|&c| crate::kmer_locator::is_acgt(c))
+                        .then(|| self.sbwt.search(kmer)).flatten().map(|range| range.start);
+                    colex_positions.push(color_id(colex));
+                }
+            },
         }
 
         // Pass 2: look up set ids right-to-left, reusing set ids for the next k-mer whenever possible

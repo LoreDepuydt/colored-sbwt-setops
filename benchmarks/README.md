@@ -96,7 +96,7 @@ bash queue_oldfilter.bash                 # the three-way merge of our earlier w
 The checks that the results equal the index built from scratch are part of the queues (`checks.tsv`);
 `merge_check.bash`, `stream_check.bash` and `pneumo_check.bash` are the full checks on *S. pneumoniae*.
 All runs use `--no-lcs`, as in the paper: the operations then find the (k-1)-suffix groups from the
-SBWTs, and the results cannot be queried.
+SBWTs, and queries on the results are slower, as they search each k-mer from scratch.
 
 ## Case study (`atb/`)
 

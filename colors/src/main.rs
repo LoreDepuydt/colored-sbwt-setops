@@ -253,7 +253,7 @@ pub enum Subcommands {
 
         #[arg(long = "keep-redundant-dummies", help = "Do not remove the dummy nodes that become redundant when merging SBWTs. The result has the same k-mers and colors, but may have more dummy nodes. With more than two input indexes, the intermediate merges always keep them, and only the last merge removes them (unless this option is given).")]
         keep_redundant_dummies: bool,
-        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array and cannot be queried.")]
+        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array, which makes queries on it slower.")]
         no_lcs: bool,
     },
 
@@ -282,7 +282,7 @@ pub enum Subcommands {
 
         #[arg(long = "low-ram-mode", help = "Use slower algorithms that need less memory: to combine the SBWTs, and, for the inputs that have no LCS array (or with --no-lcs), to find the (k-1)-suffix groups of their de Bruijn graphs. The result is the same.")]
         low_ram_mode: bool,
-        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array and cannot be queried.")]
+        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array, which makes queries on it slower.")]
         no_lcs: bool,
     },
 
@@ -314,7 +314,7 @@ pub enum Subcommands {
 
         #[arg(long = "low-ram-mode", help = "Use slower algorithms that need less memory: to combine the SBWTs, and, for the inputs that have no LCS array (or with --no-lcs), to find the (k-1)-suffix groups of their de Bruijn graphs. The result is the same.")]
         low_ram_mode: bool,
-        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array and cannot be queried.")]
+        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array, which makes queries on it slower.")]
         no_lcs: bool,
 
         #[arg(long = "dbg-cache", hide = true, help = "For development only: a directory to store the marks of the DBG of the index in (its (k-1)-suffix groups and dummy nodes, 2 bits per node), and to take them from in later subsets of the same index, which then skip computing them")]
@@ -340,7 +340,7 @@ pub enum Subcommands {
 
         #[arg(long = "low-ram-mode", help = "Use slower algorithms that need less memory: to combine the SBWTs, and, for the inputs that have no LCS array (or with --no-lcs), to find the (k-1)-suffix groups of their de Bruijn graphs. The result is the same.")]
         low_ram_mode: bool,
-        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array and cannot be queried.")]
+        #[arg(long = "no-lcs", help = "For benchmarking only: do not use LCS arrays (the DBGs compute their (k-1)-suffix groups from the SBWTs). The result has an empty LCS array, which makes queries on it slower.")]
         no_lcs: bool,
     },
 
@@ -693,6 +693,16 @@ fn load_index_variant(path: &Path, build_select: bool) -> IndexVariant {
     } else {
         panic!("Unrecognized index serialization ID: {:?}", id_buf);
     }
+}
+
+/// Loads an index for a query.
+fn load_index_for_query(path: &Path) -> IndexVariant {
+    let index = load_index_variant(path, false); // No select support required
+    let IndexVariant::SparseDenseIndex(colored_index) = &index;
+    if colored_index.lcs().is_empty() {
+        log::warn!("{} has no LCS array, so the query searches each k-mer from scratch, which is slower", path.display());
+    }
+    index
 }
 
 fn write_index_variant(index: &IndexVariant, out: &mut impl Write) {
@@ -1258,7 +1268,7 @@ fn main() -> std::process::ExitCode {
 
         Subcommands::IntersectionPseudoalign { index: index_path, query: query_path, query_list, query_output_list, min_hits, n_threads, report_bases_covered, report_hit_counts, sort_output, themisto1_output_format, output} => {
             log::info!("Loading index");
-            let index = load_index_variant(&index_path, false); // No select support required
+            let index = load_index_for_query(&index_path);
             let metrics = into_metric_list(report_hit_counts, report_bases_covered);
             let output_format = resolve_output_format(themisto1_output_format, &metrics);
 
@@ -1279,7 +1289,7 @@ fn main() -> std::process::ExitCode {
         },
         Subcommands::ThresholdPseudoalign { index: index_path, query: query_path, query_list, query_output_list, min_hits, threshold, denominator, n_threads, report_hit_counts, report_bases_covered, sort_output, themisto1_output_format, output} => {
             log::info!("Loading index");
-            let index = load_index_variant(&index_path, false); // No select support required
+            let index = load_index_for_query(&index_path);
             let metrics = into_metric_list(report_hit_counts, report_bases_covered);
             let output_format = resolve_output_format(themisto1_output_format, &metrics);
             let io_file_pairs = get_input_and_output_files(query_path, output, query_list, query_output_list);
@@ -1297,7 +1307,7 @@ fn main() -> std::process::ExitCode {
         },
         Subcommands::PrintColorSets { index: index_path, query: query_path, print_kmers, output } => {
             log::info!("Loading index");
-            let index = load_index_variant(&index_path, false); // No select support required
+            let index = load_index_for_query(&index_path);
             let out = open_output(output);
             match index {
                 IndexVariant::SparseDenseIndex(idx) => print_color_sets(&idx, &query_path, print_kmers, out),

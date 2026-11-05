@@ -22,7 +22,7 @@ use crate::{colex_colored_kmers::CompactColexKmers, coloring_interface::ColorSet
 
 /// Whether the set operations use LCS arrays. Without (`--no-lcs`, for benchmarking only), their
 /// inputs are loaded without their LCS arrays, every DBG computes its (k-1)-suffix groups from its
-/// SBWT instead, and the result gets an empty LCS array, so that it cannot be queried.
+/// SBWT instead, and the result gets an empty LCS array, which makes queries on it slower.
 static USE_LCS: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn set_use_lcs(use_lcs: bool) {

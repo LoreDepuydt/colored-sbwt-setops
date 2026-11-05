@@ -128,7 +128,7 @@ fn follow_outedge(sbwt: &SbwtIndex<SubsetMatrix>, k_minus_1_marks: &BitVec, v: u
     (!range.is_empty()).then_some(range.start)
 }
 
-fn is_acgt(c: u8) -> bool {
+pub(crate) fn is_acgt(c: u8) -> bool {
     matches!(c, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't')
 }
 

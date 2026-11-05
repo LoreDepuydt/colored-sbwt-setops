@@ -108,6 +108,46 @@ fn file_colors_with_grouped_files_match_concatenated_files() {
 }
 
 #[test]
+fn queries_without_lcs_match_queries_with_lcs() {
+    let dir = tmp_dir();
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Sequences of the index, one with invalid characters, one in lowercase, one shorter than k,
+    // and one that is not in it
+    let mut query = std::fs::read_to_string(format!("{}/tests/data/color1.fna", PROJECT_DIR)).unwrap();
+    query.push_str(">invalid\nACGTNACGTACGNNTTGCA\n>lower\nacgtacgtttgca\n>short\nAC\n>absent\nTTTTTTTTTTTTTTTTTTTT\n");
+    let query_path = dir.join("query.fna");
+    std::fs::write(&query_path, query).unwrap();
+
+    let mut outputs = Vec::new();
+    for (name, build_extra) in [("with_lcs", None), ("no_lcs", Some("--no-lcs"))] {
+        let index = dir.join(format!("{}.thm2", name));
+        let status = themisto2()
+            .args(["build", "--file-colors", "tests/data/fof.txt", "--temp-dir"]).arg(&tmp)
+            .args(["-k", "3", "-t", "1", "-o"]).arg(&index)
+            .args(build_extra)
+            .status().unwrap();
+        assert!(status.success(), "build ({}) failed", name);
+
+        let queries: [&[&str]; 3] = [
+            &["intersection-pseudoalign", "--min-hits", "1", "-t", "1"],
+            &["threshold-pseudoalign", "--threshold", "0.7", "--denominator", "all", "--min-hits", "1", "-t", "1"],
+            &["print-color-sets"],
+        ];
+        let mut output = Vec::new();
+        for query in queries {
+            let result = themisto2().args(query).arg("-q").arg(&query_path).arg("-i").arg(&index).output().unwrap();
+            assert!(result.status.success(), "{} ({}) failed: {}", query[0], name, String::from_utf8_lossy(&result.stderr));
+            assert!(!result.stdout.is_empty(), "{} ({}) wrote nothing", query[0], name);
+            output.push(result.stdout);
+        }
+        outputs.push(output);
+    }
+    assert_eq!(outputs[0], outputs[1], "Queries without an LCS array differ from queries with one");
+}
+
+#[test]
 fn subset_without_lcs_matches_subset_with_lcs() {
     // subset --no-lcs skips the LCS array of its input when loading it, so this also checks that
     // the color sets and the mapping after it are read from the right place. The input is built
